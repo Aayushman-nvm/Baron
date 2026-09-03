@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.local
+.env.backup*
+.env.*.local
+
+# temporary files
+tmp/
+backups/
+build/
+.playwright-mcp/
+
+# Go
+api/tmp/
+api/worker
+
+# Node
+web/node_modules/
+web/dist/
+
+# Personal mise overrides on top of the committed mise.toml. mise.lock itself
+# is committed; only the lockfile for these local overrides is not.
+mise.local.toml
+mise.local.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# E2E
+test/e2e/node_modules/
+test/e2e/test-results/
+test/e2e/playwright-report/
+test/e2e/.auth/
+
+# Docker
+docker/data/
