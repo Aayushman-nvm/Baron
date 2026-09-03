@@ -1,0 +1,108 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { getSystemSettings, getSystemSetting, setSystemSetting, deleteSystemSetting, getPublicSettings, getSMTPConfig, setSMTPConfig, testSMTPConfig, getOAuthConfig, setOAuthConfig } from '@/api/systemSettings'
+import type { SMTPConfig, OAuthProviderConfig } from '@/api/systemSettings'
+
+export function useSystemSettings() {
+  return useQuery({
+    queryKey: ['system-settings'],
+    queryFn: getSystemSettings,
+  })
+}
+
+export function useSystemSetting<T = unknown>(key: string) {
+  return useQuery({
+    queryKey: ['system-settings', key],
+    queryFn: async () => {
+      const setting = await getSystemSetting(key)
+      return setting.value as T
+    },
+    enabled: !!key,
+  })
+}
+
+export function useSetSystemSetting() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ key, value }: { key: string; value: unknown }) =>
+      setSystemSetting(key, value),
+    onMutate: async ({ key, value }) => {
+      await qc.cancelQueries({ queryKey: ['public-settings'] })
+      const previous = qc.getQueryData<Record<string, unknown>>(['public-settings'])
+      if (previous) {
+        qc.setQueryData(['public-settings'], { ...previous, [key]: value })
+      }
+      return { previous }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) {
+        qc.setQueryData(['public-settings'], context.previous)
+      }
+    },
+    onSettled: (_data, _err, { key }) => {
+      qc.invalidateQueries({ queryKey: ['system-settings'] })
+      qc.invalidateQueries({ queryKey: ['system-settings', key] })
+      qc.invalidateQueries({ queryKey: ['public-settings'] })
+    },
+  })
+}
+
+export function useDeleteSystemSetting() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (key: string) => deleteSystemSetting(key),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['system-settings'] })
+      qc.invalidateQueries({ queryKey: ['public-settings'] })
+    },
+  })
+}
+
+export function usePublicSettings() {
+  return useQuery({
+    queryKey: ['public-settings'],
+    queryFn: getPublicSettings,
+    staleTime: 5 * 60 * 1000,
+  })
+}
+
+export function useSMTPConfig() {
+  return useQuery({
+    queryKey: ['system-settings', 'smtp_config'],
+    queryFn: getSMTPConfig,
+  })
+}
+
+export function useSetSMTPConfig() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (config: SMTPConfig) => setSMTPConfig(config),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['system-settings', 'smtp_config'] })
+    },
+  })
+}
+
+export function useTestSMTP() {
+  return useMutation({
+    mutationFn: () => testSMTPConfig(),
+  })
+}
+
+export function useOAuthConfig(provider: string) {
+  return useQuery({
+    queryKey: ['system-settings', 'oauth_config', provider],
+    queryFn: () => getOAuthConfig(provider),
+    enabled: !!provider,
+  })
+}
+
+export function useSetOAuthConfig(provider: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (config: OAuthProviderConfig) => setOAuthConfig(provider, config),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['system-settings', 'oauth_config', provider] })
+      qc.invalidateQueries({ queryKey: ['public-settings'] })
+    },
+  })
+}
