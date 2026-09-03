@@ -1,0 +1,56 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+html {
+  scrollbar-gutter: stable;
+  scrollbar-color: #d1d5db #f9fafb;
+  background-color: #f9fafb;
+}
+
+html:where(.dark) {
+  scrollbar-color: #374151 #111827;
+  background-color: #111827;
+  color-scheme: dark;
+}
+
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes confirm-fade {
+  0% { opacity: 0; transform: scale(0.8); }
+  15% { opacity: 1; transform: scale(1); }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.animate-confirm {
+  animation: confirm-fade 1.5s ease-out forwards;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(0.5rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes inbox-highlight {
+  0% { background-color: transparent; }
+  20% { background-color: var(--inbox-highlight-color); }
+  100% { background-color: transparent; }
+}
+
+html { --inbox-highlight-color: rgb(199 210 254 / 0.5); }
+html:where(.dark) { --inbox-highlight-color: rgb(67 56 202 / 0.2); }
+
+
+/* TF-350: highlight the description text an open inline-comment thread refers to */
+::highlight(inline-comment-anchor) {
+  background-color: rgb(99 102 241 / 0.28);
+  color: inherit;
+}
