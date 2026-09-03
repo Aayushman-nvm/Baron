@@ -1,0 +1,223 @@
+import { test, expect } from '../../lib/fixtures';
+
+async function attach(page: any, testInfo: any, name: string) {
+  const screenshot = await page.screenshot();
+  await testInfo.attach(name, { body: screenshot, contentType: 'image/png' });
+}
+
+async function dismissWelcomeModal(page: any) {
+  const heading = page.getByRole('heading', { name: 'Welcome' });
+  if (await heading.isVisible({ timeout: 2000 }).catch(() => false)) {
+    const checkbox = page.getByRole('checkbox', { name: "Don't show this again" });
+    if (await checkbox.isVisible({ timeout: 500 }).catch(() => false)) {
+      await checkbox.check();
+    }
+    await page.keyboard.press('Escape');
+    await heading.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
+  }
+}
+
+async function navigateToAPIKeysTab(page: any) {
+  await page.goto('/');
+  await dismissWelcomeModal(page);
+  await page.goto('/preferences/authentication');
+  await expect(page.getByRole('heading', { name: 'Authentication' })).toBeVisible();
+  // Click the API Keys tab
+  await page.getByRole('button', { name: 'API Keys' }).click();
+}
+
+async function createKey(page: any, name: string) {
+  await page.getByPlaceholder('e.g. CI/CD Pipeline').fill(name);
+  await page.getByRole('button', { name: 'Create Key' }).click();
+  await expect(page.getByText('API key created')).toBeVisible({ timeout: 10000 });
+}
+
+test.describe('API Key Management', () => {
+  test('navigate to API keys via sidebar and tab', async ({ page }, testInfo) => {
+    await page.goto('/');
+    await dismissWelcomeModal(page);
+
+    await page.goto('/preferences');
+    // Should redirect to /preferences/profile
+    await expect(page).toHaveURL(/preferences\/profile/);
+    await attach(page, testInfo, '01-profile-page');
+
+    // Click the Authentication sidebar link
+    await page.getByRole('link', { name: 'Authentication' }).click();
+    await expect(page).toHaveURL(/preferences\/authentication/);
+    await attach(page, testInfo, '02-authentication-page');
+
+    // Verify page heading
+    await expect(page.getByRole('heading', { name: 'Authentication' })).toBeVisible();
+
+    // Click API Keys tab
+    await page.getByRole('button', { name: 'API Keys' }).click();
+    await expect(page.getByText('No API keys yet')).toBeVisible();
+    await attach(page, testInfo, '03-api-keys-tab');
+  });
+
+  test('old api-keys URL redirects to authentication', async ({ page }, testInfo) => {
+    await page.goto('/');
+    await dismissWelcomeModal(page);
+
+    await page.goto('/preferences/api-keys');
+    await expect(page).toHaveURL(/preferences\/authentication/);
+    await attach(page, testInfo, '01-redirected');
+  });
+
+  test('create an API key and verify it appears in the list', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+    await attach(page, testInfo, '01-empty-state');
+
+    // Create the key
+    await createKey(page, 'E2E Test Key');
+    await expect(page.getByText('Copy your key now')).toBeVisible();
+
+    // Verify the key value starts with twk_
+    const keyCode = page.locator('.border-amber-300 code, .border-amber-700 code');
+    const keyText = await keyCode.textContent();
+    expect(keyText).toMatch(/^twk_/);
+    await attach(page, testInfo, '02-key-revealed');
+
+    // Dismiss the reveal card
+    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(page.getByText('API key created')).not.toBeVisible();
+
+    // Verify key appears in the list
+    await expect(page.getByText('E2E Test Key')).toBeVisible();
+    await attach(page, testInfo, '03-key-in-list');
+  });
+
+  test('create and delete an API key', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+
+    // Create a key
+    await createKey(page, 'Key To Delete');
+    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(page.getByText('Key To Delete')).toBeVisible();
+    await attach(page, testInfo, '01-key-created');
+
+    // Click the trash icon button (find by the svg inside)
+    await page.locator('button:has(.lucide-trash-2)').click();
+
+    // Verify delete confirmation modal
+    await expect(page.getByRole('heading', { name: 'Delete API Key' })).toBeVisible();
+    await attach(page, testInfo, '02-delete-modal');
+
+    // Confirm deletion
+    await page.getByRole('button', { name: 'Delete' }).click();
+
+    // Wait for modal to close, then verify key is gone from the list
+    await expect(page.getByRole('heading', { name: 'Delete API Key' })).not.toBeVisible();
+    await expect(page.locator('span').filter({ hasText: 'Key To Delete' })).not.toBeVisible();
+    await attach(page, testInfo, '03-key-deleted');
+  });
+
+  test('create API key with read-only permission and expiration', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+
+    // Fill form with specific options
+    await page.getByPlaceholder('e.g. CI/CD Pipeline').fill('Read Only Key');
+
+    // Select Read only permission
+    const permSelect = page.locator('select').first();
+    await permSelect.selectOption('read');
+
+    // Select 7 days expiration
+    const expSelect = page.locator('select').nth(1);
+    await expSelect.selectOption('7');
+
+    await attach(page, testInfo, '01-form-configured');
+
+    // Create
+    await page.getByRole('button', { name: 'Create Key' }).click();
+    await expect(page.getByText('API key created')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Done' }).click();
+
+    // Verify the key shows Read only badge (use exact locator for the badge span)
+    await expect(page.locator('span.rounded-full').filter({ hasText: /^Read only$/ })).toBeVisible();
+    await attach(page, testInfo, '02-key-with-permissions');
+  });
+
+  test('require name to create API key', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+
+    // Try to create without a name
+    await page.getByRole('button', { name: 'Create Key' }).click();
+
+    // Verify validation error
+    await expect(page.getByText('Key name is required')).toBeVisible();
+    await attach(page, testInfo, '01-validation-error');
+  });
+
+  test('rename an API key inline', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+
+    // Create a key first
+    await createKey(page, 'Original Name');
+    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(page.getByText('Original Name')).toBeVisible();
+    await attach(page, testInfo, '01-key-created');
+
+    // Click the pencil/edit icon to start renaming
+    await page.locator('button:has(.lucide-pencil)').click();
+
+    // Verify the inline edit input is visible (it gets autofocus)
+    const editInput = page.getByRole('textbox').last();
+    await expect(editInput).toBeVisible();
+    await expect(editInput).toHaveValue('Original Name');
+    await attach(page, testInfo, '02-inline-edit');
+
+    // Clear and type new name
+    await editInput.clear();
+    await editInput.fill('Renamed Key');
+
+    // Submit by clicking the check icon
+    await page.locator('button:has(.lucide-check)').click();
+
+    // Verify the name was updated (green check appears briefly, then the new name stays)
+    await expect(page.getByText('Renamed Key')).toBeVisible();
+    await attach(page, testInfo, '03-key-renamed');
+  });
+
+  test('cancel API key rename with Escape', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+
+    // Create a key first
+    await createKey(page, 'Keep This Name');
+    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(page.getByText('Keep This Name')).toBeVisible();
+
+    // Start editing
+    await page.locator('button:has(.lucide-pencil)').click();
+    const editInput = page.getByRole('textbox').last();
+    await expect(editInput).toBeVisible();
+
+    // Type a new name but cancel with Escape
+    await editInput.clear();
+    await editInput.fill('Should Not Save');
+    await page.keyboard.press('Escape');
+
+    // Verify the original name is still shown
+    await expect(page.getByText('Keep This Name')).toBeVisible();
+    await expect(page.getByText('Should Not Save')).not.toBeVisible();
+    await attach(page, testInfo, '01-rename-cancelled');
+  });
+
+  test('navigate between appearance and authentication via sidebar', async ({ page }, testInfo) => {
+    await navigateToAPIKeysTab(page);
+    await attach(page, testInfo, '01-api-keys-tab');
+
+    // Click Appearance in sidebar
+    await page.getByRole('link', { name: 'Appearance' }).click();
+    await expect(page).toHaveURL(/preferences\/appearance/);
+    await expect(page.getByRole('heading', { name: 'Appearance' })).toBeVisible();
+    await attach(page, testInfo, '02-appearance-page');
+
+    // Navigate back to Authentication
+    await page.getByRole('link', { name: 'Authentication' }).click();
+    await expect(page).toHaveURL(/preferences\/authentication/);
+    await expect(page.getByRole('heading', { name: 'Authentication' })).toBeVisible();
+    await attach(page, testInfo, '03-back-to-authentication');
+  });
+});
