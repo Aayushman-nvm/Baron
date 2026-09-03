@@ -1,0 +1,1074 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
+
+	"github.com/marcoshack/taskwondo/internal/model"
+	"github.com/marcoshack/taskwondo/internal/service"
+)
+
+// InviteAcceptor accepts a project invite on behalf of a user.
+type InviteAcceptor interface {
+	AcceptInvite(ctx context.Context, info *model.AuthInfo, code string) (*service.AcceptInviteResult, error)
+}
+
+// PortalProjectResolver looks up a user's customer-role project memberships.
+type PortalProjectResolver interface {
+	ListByUser(ctx context.Context, userID uuid.UUID) ([]model.ProjectMemberWithProject, error)
+}
+
+// NamespaceMemberResolver looks up a user's direct namespace memberships.
+type NamespaceMemberResolver interface {
+	CountByUser(ctx context.Context, userID uuid.UUID) (int, error)
+}
+
+// AuthHandler handles authentication endpoints.
+type AuthHandler struct {
+	auth         *service.AuthService
+	invites      InviteAcceptor
+	memberRepo   PortalProjectResolver
+	nsMemberRepo NamespaceMemberResolver
+}
+
+// NewAuthHandler creates a new AuthHandler.
+func NewAuthHandler(auth *service.AuthService, invites InviteAcceptor, memberRepo PortalProjectResolver, nsMemberRepo NamespaceMemberResolver) *AuthHandler {
+	return &AuthHandler{auth: auth, invites: invites, memberRepo: memberRepo, nsMemberRepo: nsMemberRepo}
+}
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type portalProjectInfo struct {
+	ProjectKey  string `json:"project_key"`
+	ProjectName string `json:"project_name"`
+	Namespace   string `json:"namespace"`
+}
+
+// userResponse is the authenticated user's own record. HasPassword tells the
+// client whether to offer "change password" or "set password"; it is deliberately
+// absent from otherUserResponse so one user cannot probe another's sign-in method.
+type userResponse struct {
+	ID                   uuid.UUID           `json:"id"`
+	Email                string              `json:"email"`
+	DisplayName          string              `json:"display_name"`
+	GlobalRole           string              `json:"global_role"`
+	AvatarURL            *string             `json:"avatar_url,omitempty"`
+	HasPassword          bool                `json:"has_password"`
+	PortalProjects       []portalProjectInfo `json:"portal_projects,omitempty"`
+	TotalProjectCount    int                 `json:"total_project_count,omitempty"`
+	NamespaceMemberCount int                 `json:"namespace_member_count,omitempty"`
+}
+
+func toUserResponse(u *model.User) userResponse {
+	resp := userResponse{
+		ID:          u.ID,
+		Email:       u.Email,
+		DisplayName: u.DisplayName,
+		GlobalRole:  u.GlobalRole,
+		HasPassword: u.PasswordHash != "",
+	}
+	resp.AvatarURL = avatarURL(u.AvatarURL, u.ID, u.UpdatedAt.Unix())
+	return resp
+}
+
+// otherUserResponse is the shape returned for users other than the caller.
+type otherUserResponse struct {
+	ID          uuid.UUID `json:"id"`
+	Email       string    `json:"email"`
+	DisplayName string    `json:"display_name"`
+	GlobalRole  string    `json:"global_role"`
+	AvatarURL   *string   `json:"avatar_url,omitempty"`
+}
+
+func toOtherUserResponse(u *model.User) otherUserResponse {
+	return otherUserResponse{
+		ID:          u.ID,
+		Email:       u.Email,
+		DisplayName: u.DisplayName,
+		GlobalRole:  u.GlobalRole,
+		AvatarURL:   avatarURL(u.AvatarURL, u.ID, u.UpdatedAt.Unix()),
+	}
+}
+
+// Login authenticates a user with email and password.
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Email == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "email and password are required")
+		return
+	}
+
+	token, user, err := h.auth.Login(r.Context(), req.Email, req.Password)
+	if err != nil {
+		if errors.Is(err, model.ErrInvalidCredentials) {
+			writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid email or password")
+			return
+		}
+		if errors.Is(err, model.ErrAccountDisabled) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "account is disabled")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("login failed")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := toUserResponse(user)
+	h.populatePortalProjects(r.Context(), user.ID, &resp)
+
+	writeData(w, http.StatusOK, map[string]interface{}{
+		"token":                 token,
+		"user":                  resp,
+		"force_password_change": user.ForcePasswordChange,
+	})
+}
+
+// Refresh issues a new JWT token for an authenticated user.
+func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	token, err := h.auth.Refresh(r.Context(), info)
+	if err != nil {
+		if errors.Is(err, model.ErrAccountDisabled) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "account is disabled")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("token refresh failed")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]interface{}{
+		"token": token,
+	})
+}
+
+// Me returns the authenticated user's profile.
+func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	user, err := h.auth.GetUser(r.Context(), info.UserID)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to get user")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := toUserResponse(user)
+	h.populatePortalProjects(r.Context(), info.UserID, &resp)
+
+	writeData(w, http.StatusOK, resp)
+}
+
+// populatePortalProjects adds customer-role project memberships, total project count, and
+// direct namespace membership count to the user response. These fields are used by the
+// frontend to decide whether the user should see the portal-only view or the regular shell.
+func (h *AuthHandler) populatePortalProjects(ctx context.Context, userID uuid.UUID, resp *userResponse) {
+	if h.memberRepo != nil {
+		memberships, err := h.memberRepo.ListByUser(ctx, userID)
+		if err == nil {
+			resp.TotalProjectCount = len(memberships)
+			for _, m := range memberships {
+				if m.Role == model.ProjectRoleCustomer {
+					ns := m.NamespaceSlug
+					if ns == "default" {
+						ns = "d"
+					}
+					resp.PortalProjects = append(resp.PortalProjects, portalProjectInfo{
+						ProjectKey:  m.ProjectKey,
+						ProjectName: m.ProjectName,
+						Namespace:   ns,
+					})
+				}
+			}
+		}
+	}
+
+	if h.nsMemberRepo != nil {
+		if count, err := h.nsMemberRepo.CountByUser(ctx, userID); err == nil {
+			resp.NamespaceMemberCount = count
+		}
+	}
+}
+
+// Logout is a no-op for stateless JWT auth. The client should discard the token.
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// AuthProviders returns which auth providers are enabled.
+func (h *AuthHandler) AuthProviders(w http.ResponseWriter, r *http.Request) {
+	writeData(w, http.StatusOK, h.auth.EnabledProviders(r.Context()))
+}
+
+// OAuth handlers (generic for all providers)
+
+type oauthCallbackRequest struct {
+	Code  string `json:"code"`
+	State string `json:"state"`
+}
+
+// OAuthAuth returns the OAuth authorization URL for the given provider.
+func (h *AuthHandler) OAuthAuth(w http.ResponseWriter, r *http.Request) {
+	provider := chi.URLParam(r, "provider")
+
+	authURL, err := h.auth.OAuthURL(r.Context(), provider)
+	if err != nil {
+		writeError(w, http.StatusNotFound, CodeNotConfigured, provider+" oauth is not configured")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]string{
+		"url": authURL,
+	})
+}
+
+// OAuthCallback exchanges the authorization code and logs in or registers the user.
+func (h *AuthHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
+	provider := chi.URLParam(r, "provider")
+
+	var req oauthCallbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Code == "" || req.State == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "code and state are required")
+		return
+	}
+
+	token, user, err := h.auth.OAuthCallback(r.Context(), provider, req.Code, req.State)
+	if err != nil {
+		if errors.Is(err, model.ErrAccountDisabled) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "account is disabled")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg(provider + " oauth callback failed")
+		writeError(w, http.StatusUnauthorized, CodeOAuthError, provider+" authentication failed")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]interface{}{
+		"token": token,
+		"user":  toUserResponse(user),
+	})
+}
+
+// API Key handlers
+
+type createAPIKeyRequest struct {
+	Name        string   `json:"name"`
+	Permissions []string `json:"permissions"`
+	ExpiresAt   *string  `json:"expires_at,omitempty"`
+}
+
+type apiKeyResponse struct {
+	ID          uuid.UUID  `json:"id"`
+	Name        string     `json:"name"`
+	KeyPrefix   string     `json:"key_prefix"`
+	Permissions []string   `json:"permissions"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+func toAPIKeyResponse(k *model.APIKey) apiKeyResponse {
+	return apiKeyResponse{
+		ID:          k.ID,
+		Name:        k.Name,
+		KeyPrefix:   k.KeyPrefix,
+		Permissions: k.Permissions,
+		LastUsedAt:  k.LastUsedAt,
+		ExpiresAt:   k.ExpiresAt,
+		CreatedAt:   k.CreatedAt,
+	}
+}
+
+// ListAPIKeys returns all API keys for the authenticated user.
+func (h *AuthHandler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	keys, err := h.auth.ListAPIKeys(r.Context(), info.UserID)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to list api keys")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := make([]apiKeyResponse, len(keys))
+	for i := range keys {
+		resp[i] = toAPIKeyResponse(&keys[i])
+	}
+
+	writeData(w, http.StatusOK, resp)
+}
+
+// CreateAPIKey creates a new API key for the authenticated user.
+func (h *AuthHandler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	var req createAPIKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "name is required")
+		return
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != nil {
+		t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, CodeValidationError, "expires_at must be in RFC3339 format")
+			return
+		}
+		if t.Before(time.Now()) {
+			writeError(w, http.StatusBadRequest, CodeValidationError, "expires_at must be in the future")
+			return
+		}
+		expiresAt = &t
+	}
+
+	if req.Permissions == nil {
+		req.Permissions = []string{}
+	}
+
+	apiKey, fullKey, err := h.auth.CreateAPIKey(r.Context(), info.UserID, req.Name, req.Permissions, expiresAt)
+	if err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to create api key")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusCreated, map[string]interface{}{
+		"id":          apiKey.ID,
+		"name":        apiKey.Name,
+		"key":         fullKey,
+		"key_prefix":  apiKey.KeyPrefix,
+		"permissions": apiKey.Permissions,
+		"expires_at":  apiKey.ExpiresAt,
+		"created_at":  apiKey.CreatedAt,
+	})
+}
+
+// SearchUsers handles GET /api/v1/users?q=...
+func (h *AuthHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+
+	users, err := h.auth.SearchUsers(r.Context(), info.UserID, query)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to search users")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := make([]userSearchResponse, len(users))
+	for i := range users {
+		resp[i] = userSearchResponse{
+			otherUserResponse: toOtherUserResponse(&users[i].User),
+			NamespaceSlugs:    users[i].NamespaceSlugs,
+		}
+		if resp[i].NamespaceSlugs == nil {
+			resp[i].NamespaceSlugs = []string{}
+		}
+	}
+	writeData(w, http.StatusOK, resp)
+}
+
+// userSearchResponse augments userResponse with the slugs of namespaces the
+// user belongs to, so callers can decide whether to add the user directly or
+// route through an email invite.
+type userSearchResponse struct {
+	otherUserResponse
+	NamespaceSlugs []string `json:"namespace_slugs"`
+}
+
+// SearchUsersDeprecated handles GET /api/v1/users/search?q=... (deprecated path).
+func (h *AuthHandler) SearchUsersDeprecated(w http.ResponseWriter, r *http.Request) {
+	log.Ctx(r.Context()).Warn().Msg("deprecated: use '/api/v1/users' instead of '/api/v1/users/search'")
+	h.SearchUsers(w, r)
+}
+
+type changePasswordRequest struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+// ChangePassword handles POST /api/v1/auth/change-password.
+func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	var req changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.NewPassword == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "new_password is required")
+		return
+	}
+
+	if err := h.auth.ChangePassword(r.Context(), info.UserID, req.OldPassword, req.NewPassword); err != nil {
+		if errors.Is(err, model.ErrInvalidCredentials) {
+			writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid current password")
+			return
+		}
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to change password")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	// Get updated user and generate new token without force_password_change
+	user, err := h.auth.GetUser(r.Context(), info.UserID)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to get user after password change")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	token, err := h.auth.Refresh(r.Context(), &model.AuthInfo{
+		UserID:     user.ID,
+		Email:      user.Email,
+		GlobalRole: user.GlobalRole,
+	})
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to generate token after password change")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]interface{}{
+		"token": token,
+	})
+}
+
+type renameAPIKeyRequest struct {
+	Name string `json:"name"`
+}
+
+// RenameAPIKey updates the display name of an API key.
+func (h *AuthHandler) RenameAPIKey(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	keyID, ok := parseUUIDParam(w, r, "keyId", "invalid key ID")
+	if !ok {
+		return
+	}
+
+	var req renameAPIKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if err := h.auth.RenameAPIKey(r.Context(), keyID, info.UserID, req.Name); err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "api key not found")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to rename api key")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteAPIKey deletes an API key by ID.
+func (h *AuthHandler) DeleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	keyID, ok := parseUUIDParam(w, r, "keyId", "invalid key ID")
+	if !ok {
+		return
+	}
+
+	if err := h.auth.DeleteAPIKey(r.Context(), keyID, info.UserID); err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "api key not found")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to delete api key")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Connected OAuth account handlers
+
+type connectedAccountResponse struct {
+	ID               uuid.UUID `json:"id"`
+	Provider         string    `json:"provider"`
+	ProviderEmail    string    `json:"provider_email,omitempty"`
+	ProviderUsername string    `json:"provider_username,omitempty"`
+	ProviderAvatar   string    `json:"provider_avatar,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// ListConnectedAccounts returns all OAuth accounts linked to the authenticated user.
+func (h *AuthHandler) ListConnectedAccounts(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	accounts, err := h.auth.ListConnectedAccounts(r.Context(), info.UserID)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to list connected accounts")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := make([]connectedAccountResponse, len(accounts))
+	for i := range accounts {
+		resp[i] = connectedAccountResponse{
+			ID:               accounts[i].ID,
+			Provider:         accounts[i].Provider,
+			ProviderEmail:    accounts[i].ProviderEmail,
+			ProviderUsername: accounts[i].ProviderUsername,
+			ProviderAvatar:   accounts[i].ProviderAvatar,
+			CreatedAt:        accounts[i].CreatedAt,
+		}
+	}
+
+	writeData(w, http.StatusOK, resp)
+}
+
+// UnlinkConnectedAccount removes an OAuth account link for the authenticated user.
+func (h *AuthHandler) UnlinkConnectedAccount(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	accountID, ok := parseUUIDParam(w, r, "accountId", "invalid account ID")
+	if !ok {
+		return
+	}
+
+	if err := h.auth.UnlinkConnectedAccount(r.Context(), accountID, info.UserID); err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "connected account not found")
+			return
+		}
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to unlink connected account")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// System API Key handlers
+
+type createSystemAPIKeyRequest struct {
+	Name        string   `json:"name"`
+	Permissions []string `json:"permissions"`
+	ExpiresAt   *string  `json:"expires_at,omitempty"`
+}
+
+type systemAPIKeyResponse struct {
+	ID          uuid.UUID  `json:"id"`
+	Name        string     `json:"name"`
+	KeyPrefix   string     `json:"key_prefix"`
+	Permissions []string   `json:"permissions"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+func toSystemAPIKeyResponse(k *model.APIKey) systemAPIKeyResponse {
+	return systemAPIKeyResponse{
+		ID:          k.ID,
+		Name:        k.Name,
+		KeyPrefix:   k.KeyPrefix,
+		Permissions: k.Permissions,
+		CreatedBy:   k.CreatedBy,
+		LastUsedAt:  k.LastUsedAt,
+		ExpiresAt:   k.ExpiresAt,
+		CreatedAt:   k.CreatedAt,
+	}
+}
+
+// ListSystemAPIKeys returns all system API keys. Admin-only (enforced at router level).
+func (h *AuthHandler) ListSystemAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := h.auth.ListSystemAPIKeys(r.Context())
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to list system api keys")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := make([]systemAPIKeyResponse, len(keys))
+	for i := range keys {
+		resp[i] = toSystemAPIKeyResponse(&keys[i])
+	}
+
+	writeData(w, http.StatusOK, resp)
+}
+
+// CreateSystemAPIKey creates a new system API key. Admin-only (enforced at router level).
+func (h *AuthHandler) CreateSystemAPIKey(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+
+	var req createSystemAPIKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "name is required")
+		return
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != nil {
+		t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, CodeValidationError, "expires_at must be in RFC3339 format")
+			return
+		}
+		if t.Before(time.Now()) {
+			writeError(w, http.StatusBadRequest, CodeValidationError, "expires_at must be in the future")
+			return
+		}
+		expiresAt = &t
+	}
+
+	if req.Permissions == nil {
+		req.Permissions = []string{}
+	}
+
+	apiKey, fullKey, err := h.auth.CreateSystemAPIKey(r.Context(), info.UserID, req.Name, req.Permissions, expiresAt)
+	if err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to create system api key")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusCreated, map[string]interface{}{
+		"id":          apiKey.ID,
+		"name":        apiKey.Name,
+		"key":         fullKey,
+		"key_prefix":  apiKey.KeyPrefix,
+		"permissions": apiKey.Permissions,
+		"created_by":  apiKey.CreatedBy,
+		"expires_at":  apiKey.ExpiresAt,
+		"created_at":  apiKey.CreatedAt,
+	})
+}
+
+// RenameSystemAPIKey updates the display name of a system API key. Admin-only (enforced at router level).
+func (h *AuthHandler) RenameSystemAPIKey(w http.ResponseWriter, r *http.Request) {
+	keyID, ok := parseUUIDParam(w, r, "keyId", "invalid key ID")
+	if !ok {
+		return
+	}
+
+	var req renameAPIKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if err := h.auth.RenameSystemAPIKey(r.Context(), keyID, req.Name); err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "system api key not found")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to rename system api key")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteSystemAPIKey deletes a system API key by ID. Admin-only (enforced at router level).
+func (h *AuthHandler) DeleteSystemAPIKey(w http.ResponseWriter, r *http.Request) {
+	keyID, ok := parseUUIDParam(w, r, "keyId", "invalid key ID")
+	if !ok {
+		return
+	}
+
+	if err := h.auth.DeleteSystemAPIKey(r.Context(), keyID); err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "system api key not found")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to delete system api key")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Registration handlers
+
+type registerRequest struct {
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
+	InviteCode  string `json:"invite_code,omitempty"`
+}
+
+// Register handles POST /api/v1/auth/register.
+func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	var req registerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Email == "" || req.DisplayName == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "email and display_name are required")
+		return
+	}
+
+	if err := h.auth.RequestRegistration(r.Context(), req.Email, req.DisplayName, req.InviteCode); err != nil {
+		if errors.Is(err, model.ErrForbidden) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "email registration is disabled")
+			return
+		}
+		if errors.Is(err, model.ErrAlreadyExists) {
+			writeError(w, http.StatusConflict, CodeConflict, "a user with this email already exists")
+			return
+		}
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("registration failed")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]string{
+		"message": "verification email sent",
+	})
+}
+
+type verifyEmailRequest struct {
+	Token    string `json:"token"`
+	Password string `json:"password"`
+}
+
+// VerifyEmail handles POST /api/v1/auth/verify-email.
+func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
+	var req verifyEmailRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Token == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "token and password are required")
+		return
+	}
+
+	result, err := h.auth.VerifyEmailAndCreateUser(r.Context(), req.Token, req.Password)
+	if err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "invalid or expired verification token")
+			return
+		}
+		if errors.Is(err, model.ErrAlreadyExists) {
+			writeError(w, http.StatusConflict, CodeConflict, "a user with this email already exists")
+			return
+		}
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		if errors.Is(err, model.ErrForbidden) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "email registration is not configured")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("email verification failed")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	resp := map[string]interface{}{
+		"token": result.Token,
+		"user":  toUserResponse(result.User),
+	}
+
+	// Auto-accept project invite if one was stored with the verification token
+	if result.InviteCode != "" && h.invites != nil {
+		authInfo := &model.AuthInfo{UserID: result.User.ID, GlobalRole: result.User.GlobalRole}
+		inviteResult, err := h.invites.AcceptInvite(r.Context(), authInfo, result.InviteCode)
+		if err != nil {
+			log.Ctx(r.Context()).Warn().Err(err).Str("invite_code", result.InviteCode).Msg("failed to auto-accept invite after registration")
+		} else {
+			resp["project_key"] = inviteResult.Project.Key
+		}
+	}
+
+	writeData(w, http.StatusOK, resp)
+}
+
+// Password reset handlers
+
+type forgotPasswordRequest struct {
+	Email string `json:"email"`
+}
+
+// ForgotPassword handles POST /api/v1/auth/forgot-password.
+func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
+	var req forgotPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Email == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "email is required")
+		return
+	}
+
+	if err := h.auth.RequestPasswordReset(r.Context(), req.Email); err != nil {
+		if errors.Is(err, model.ErrForbidden) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "password reset is not available")
+			return
+		}
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("password reset request failed")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	// Always return the same message to prevent user enumeration
+	writeData(w, http.StatusOK, map[string]string{
+		"message": "if an account exists with this email, a password reset link has been sent",
+	})
+}
+
+type resetPasswordRequest struct {
+	Token    string `json:"token"`
+	Password string `json:"password"`
+}
+
+// ResetPassword handles POST /api/v1/auth/reset-password.
+func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	var req resetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	if req.Token == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "token and password are required")
+		return
+	}
+
+	token, user, err := h.auth.ResetPasswordWithToken(r.Context(), req.Token, req.Password)
+	if err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "invalid or expired reset token")
+			return
+		}
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		if errors.Is(err, model.ErrForbidden) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "password reset is not available")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("password reset failed")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]interface{}{
+		"token": token,
+		"user":  toUserResponse(user),
+	})
+}
+
+// Profile endpoints
+
+type updateProfileRequest struct {
+	DisplayName string `json:"display_name"`
+}
+
+// UpdateProfile handles PATCH /api/v1/user/profile.
+func (h *AuthHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	var req updateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid request body")
+		return
+	}
+
+	user, err := h.auth.UpdateProfile(r.Context(), info.UserID, req.DisplayName)
+	if err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to update profile")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, toUserResponse(user))
+}
+
+// UploadAvatar handles POST /api/v1/user/avatar.
+func (h *AuthHandler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "invalid multipart form")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "file is required")
+		return
+	}
+	defer file.Close()
+
+	contentType := header.Header.Get("Content-Type")
+	if contentType != "image/jpeg" && contentType != "image/png" {
+		writeError(w, http.StatusBadRequest, CodeValidationError, "only JPEG and PNG files are allowed")
+		return
+	}
+
+	if header.Size > 2<<20 {
+		writeError(w, http.StatusRequestEntityTooLarge, CodeValidationError, "file must be under 2 MB")
+		return
+	}
+
+	user, err := h.auth.UploadAvatar(r.Context(), info.UserID, file, header.Size, contentType)
+	if err != nil {
+		if errors.Is(err, model.ErrValidation) {
+			writeErrorFromService(w, http.StatusBadRequest, CodeValidationError, err)
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to upload avatar")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, toUserResponse(user))
+}
+
+// DeleteAvatar handles DELETE /api/v1/user/avatar.
+func (h *AuthHandler) DeleteAvatar(w http.ResponseWriter, r *http.Request) {
+	info := model.AuthInfoFromContext(r.Context())
+	if info == nil {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "not authenticated")
+		return
+	}
+
+	user, err := h.auth.DeleteAvatar(r.Context(), info.UserID)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to delete avatar")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	writeData(w, http.StatusOK, toUserResponse(user))
+}
+
+// GetUserAvatar handles GET /api/v1/users/{userId}/avatar.
+func (h *AuthHandler) GetUserAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, ok := parseUUIDParam(w, r, "userId", "invalid user ID")
+	if !ok {
+		return
+	}
+
+	size := r.URL.Query().Get("size")
+	reader, contentType, err := h.auth.GetAvatarFile(r.Context(), userID, size)
+	if err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "avatar not found")
+			return
+		}
+		log.Ctx(r.Context()).Error().Err(err).Msg("failed to get avatar")
+		writeError(w, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+	defer reader.Close()
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	io.Copy(w, reader)
+}
