@@ -100,7 +100,7 @@ export function projectNavItems(t: Translate, base: string, customerProject: boo
     return [{ to: `${base}/support`, label: t('sidebar.support'), icon: Headphones, end: false }]
   }
   return [
-    { to: `${base}/`, label: t('sidebar.overview'), icon: LayoutDashboard, end: true },
+    { to: `${base}`, label: t('sidebar.overview'), icon: LayoutDashboard, end: true },
     { to: `${base}/items`, label: t('sidebar.items'), icon: ClipboardList, end: false },
     { to: `${base}/milestones`, label: t('sidebar.milestones'), icon: Target, end: false },
     { to: `${base}/queues`, label: t('sidebar.queues'), icon: SquareStack, end: false },

@@ -638,7 +638,7 @@ export function WorkItemListPage() {
     {
       key: 'type',
       header: t('workitems.table.type'),
-      className: 'w-20',
+      className: 'w-28',
       sortKey: 'type',
       render: (row) => {
         const done = strikethroughEnabled && isItemCompleted(row.status, allStatuses ?? statuses)
