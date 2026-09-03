@@ -1,0 +1,24 @@
+name: Cleanup untagged images
+
+on:
+  schedule:
+    - cron: "0 3 * * 0" # every Sunday at 03:00 UTC
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  cleanup:
+    name: Delete untagged images
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [api, web, worker]
+    steps:
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: taskwondo/${{ matrix.package }}
+          delete-untagged: true
+          older-than: 14 days
+          token: ${{ secrets.GITHUB_TOKEN }}

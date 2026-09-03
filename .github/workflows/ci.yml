@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-api:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache-dependency-path: api/go.sum
+
+      - name: Run tests
+        run: make test-api
+
+  test-web:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Pin npm version
+        # Single source of truth: ARG NPM_VERSION in docker/Dockerfile.web.
+        # Keeps CI and image builds on the same pinned npm without duplication.
+        run: |
+          NPM_VERSION=$(grep -E '^ARG NPM_VERSION=' docker/Dockerfile.web | cut -d= -f2)
+          echo "Installing npm@${NPM_VERSION}"
+          npm install -g "npm@${NPM_VERSION}"
+
+      - name: Run tests and build
+        run: make test-web
+
+  test-e2e:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run E2E tests
+        run: make test-e2e
+
+      - name: Upload report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: test/e2e/playwright-report/
+          retention-days: 7
+
+  publish:
+    name: Publish Docker images
+    needs: [test-api, test-web, test-e2e]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push images
+        run: |
+          touch .env
+          IMAGE_TAG=latest docker compose build --build-arg COMMIT_SHA=${{ github.sha }} api web worker
+          IMAGE_TAG=latest docker compose push api web worker
+        env:
+          POSTGRES_USER: build
+          POSTGRES_PASSWORD: build
+          JWT_SECRET: build
+          MINIO_ROOT_USER: build
+          MINIO_ROOT_PASSWORD: build
+
+      - name: Tag and push versioned images
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          for img in api web worker; do
+            docker tag ghcr.io/marcoshack/taskwondo/$img:latest ghcr.io/marcoshack/taskwondo/$img:$VERSION
+            docker push ghcr.io/marcoshack/taskwondo/$img:$VERSION
+          done
+
+  smoke-test:
+    name: Smoke test
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for new version deployment
+        run: |
+          for i in $(seq 1 30); do
+            COMMIT=$(curl -sf ${{ secrets.STAGING_URL }}/healthz | jq -r '.commit // empty')
+            if [ "$COMMIT" = "${{ github.sha }}" ]; then
+              echo "New version deployed: $COMMIT"
+              # Verify readiness too
+              curl -sf ${{ secrets.STAGING_URL }}/readyz > /dev/null
+              echo "Readiness check passed"
+              exit 0
+            fi
+            echo "Attempt $i/30 - got '$COMMIT', waiting for ${{ github.sha }}..."
+            sleep 10
+          done
+          echo "New version not deployed after 300s"
+          exit 1
+
+  nightly-release:
+    name: Nightly release
+    needs: smoke-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache-dependency-path: |
+            api/go.sum
+            mcp/go.sum
+
+      - name: Build MCP server (Linux + macOS + Windows)
+        run: |
+          make build-mcp-linux
+          make build-mcp-darwin
+          make build-mcp-windows
+
+      - name: Build MCPB bundle
+        run: make build-mcpb
+
+      - name: Build server bundle
+        run: RELEASE_VERSION=dev make release
+
+      - name: Create or update dev release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag -f dev
+          git push -f origin dev
+
+          NOTES="Latest build from \`main\` ($(date -u '+%Y-%m-%d %H:%M UTC')), commit ${{ github.sha }}.
+
+          > **This is an automated pre-release.** For stable versions, see tagged releases.
+
+          ### Assets
+          - \`taskwondo-server-dev.tar.gz\` — Server bundle (API + Worker + Web) for manual installation
+          - \`taskwondo-mcp-linux-amd64\` — MCP server (Linux/amd64)
+          - \`taskwondo-mcp-darwin-arm64\` — MCP server (macOS/arm64)
+          - \`taskwondo-mcp-windows-amd64.exe\` — MCP server (Windows/amd64)
+          - \`taskwondo.mcpb\` — MCP bundle for Claude Desktop (Windows + macOS)"
+
+          if gh release view dev > /dev/null 2>&1; then
+            gh release edit dev --title "Dev Build" --notes "$NOTES" --prerelease
+          else
+            gh release create dev --title "Dev Build" --notes "$NOTES" --prerelease --target main
+          fi
+
+          gh release upload dev --clobber \
+            build/release/taskwondo-server-dev.tar.gz \
+            build/mcp/taskwondo-mcp-linux-amd64 \
+            build/mcp/taskwondo-mcp-darwin-arm64 \
+            build/mcp/taskwondo-mcp-windows-amd64.exe \
+            build/mcpb/taskwondo.mcpb
+
+  release:
+    name: Release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache-dependency-path: |
+            api/go.sum
+            mcp/go.sum
+
+      - name: Build MCP server (Linux + macOS + Windows)
+        run: |
+          make build-mcp-linux
+          make build-mcp-darwin
+          make build-mcp-windows
+
+      - name: Build MCPB bundle
+        run: RELEASE_VERSION=${GITHUB_REF#refs/tags/v} make build-mcpb
+
+      - name: Build server bundle
+        run: RELEASE_VERSION=${GITHUB_REF#refs/tags/v} make release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --generate-notes \
+            --draft \
+            build/release/taskwondo-server-${VERSION#v}.tar.gz \
+            build/mcp/taskwondo-mcp-linux-amd64 \
+            build/mcp/taskwondo-mcp-darwin-arm64 \
+            build/mcp/taskwondo-mcp-windows-amd64.exe \
+            build/mcpb/taskwondo-v${VERSION#v}.mcpb
