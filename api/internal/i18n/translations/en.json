@@ -1,0 +1,64 @@
+{
+  "email.assignment.subject": "[{{projectKey}}] Work item #{{itemNumber}} assigned to you: {{title}}",
+  "email.assignment.intro": "<strong>{{assignerName}}</strong> assigned a work item to you in <strong>{{projectName}}</strong>:",
+  "email.assignment.cta": "View Work Item",
+  "email.assignment.footer": "You received this email because you have assignment notifications enabled for this project. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.watcher.subject": "[{{projectKey}}] #{{itemNumber}} updated: {{title}}",
+  "email.watcher.intro": "<strong>{{actorName}}</strong> updated a work item you are watching:",
+  "email.watcher.field_changed": "{{fieldName}} changed from <strong>{{oldValue}}</strong> to <strong>{{newValue}}</strong>",
+  "email.watcher.field_set": "{{fieldName}} set to <strong>{{newValue}}</strong>",
+  "email.watcher.cta": "View Work Item",
+  "email.watcher.footer": "You received this email because you are watching this work item and have watcher notifications enabled. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.new_item.subject": "[{{projectKey}}] New {{type}} created: {{displayId}} {{title}}",
+  "email.new_item.intro": "A new <strong>{{type}}</strong> was created in your project:",
+  "email.new_item.cta": "View Work Item",
+  "email.new_item.footer": "You received this email because you have new item notifications enabled for this project. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.status_change.subject": "[{{projectKey}}] #{{itemNumber}} status changed to {{newStatus}}: {{title}}",
+  "email.status_change.intro": "<strong>{{actorName}}</strong> changed the status of a work item assigned to you:",
+  "email.status_change.status": "Status: <strong>{{oldStatus}}</strong> \u2192 <strong>{{newStatus}}</strong>",
+  "email.status_change.cta": "View Work Item",
+  "email.status_change.footer": "You received this email because you have status change notifications enabled for assigned items. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.comment_assigned.subject": "[{{projectKey}}] New comment on #{{itemNumber}}: {{title}}",
+  "email.comment_assigned.intro": "<strong>{{commenterName}}</strong> commented on a work item assigned to you:",
+  "email.comment_assigned.cta": "View Work Item",
+  "email.comment_assigned.footer": "You received this email because you have comment notifications enabled for assigned items. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.member_added.subject": "You've been added to project {{projectName}}",
+  "email.member_added.intro": "<strong>{{addedByName}}</strong> added you to the project <strong>{{projectName}}</strong> as a <strong>{{role}}</strong>.",
+  "email.member_added.cta": "View Project",
+  "email.member_added.footer": "You received this email because you have project membership notifications enabled. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.invite.subject": "You've been invited to project {{projectName}}",
+  "email.invite.intro": "<strong>{{inviterName}}</strong> invited you to join the project <strong>{{projectName}}</strong> as a <strong>{{role}}</strong>.",
+  "email.invite.cta": "Accept Invite",
+  "email.invite.footer": "You received this email because someone invited you to a Taskwondo project. If you don't recognize this invite, you can safely ignore this email.",
+
+  "email.namespace_invite.subject": "You've been invited to {{namespaceName}}",
+  "email.namespace_invite.intro": "<strong>{{inviterName}}</strong> invited you to join the workspace <strong>{{namespaceName}}</strong> as a <strong>{{role}}</strong>.",
+  "email.namespace_invite.cta": "Accept Invite",
+  "email.namespace_invite.footer": "You received this email because someone invited you to a Taskwondo workspace. If you don't recognize this invite, you can safely ignore this email.",
+
+  "email.sla_breach.subject": "[{{projectKey}}] SLA Warning: #{{itemNumber}} \u2014 \"{{title}}\" (Level {{level}})",
+  "email.sla_breach.intro": "A work item is approaching or has exceeded its SLA target:",
+  "email.sla_breach.sla_status": "SLA: <strong>{{percentage}}%</strong> of target time used",
+  "email.sla_breach.elapsed": "Time elapsed: <strong>{{elapsed}}</strong> of <strong>{{target}}</strong>",
+  "email.sla_breach.level": "Escalation Level: <strong>{{level}}</strong>",
+  "email.sla_breach.status": "Status: <strong>{{statusName}}</strong>",
+  "email.sla_breach.cta": "View Work Item",
+  "email.sla_breach.footer": "You received this email because you are on the escalation list for this project. You can change your notification preferences in your Taskwondo settings.",
+
+  "email.oncall.incoming.subject": "[{{projectKey}}] You are now on-call for {{teamName}}",
+  "email.oncall.outgoing.subject": "[{{projectKey}}] Your on-call shift for {{teamName}} has ended",
+
+  "email.oncall.override.created.subject": "[{{projectKey}}] On-call override assigned for {{teamName}}",
+  "email.oncall.override.covered.subject": "[{{projectKey}}] Your on-call shift for {{teamName}} has been covered",
+  "email.oncall.override.cancelled.subject": "[{{projectKey}}] On-call override cancelled for {{teamName}}",
+
+  "email.oncall.cta": "View on-call schedule",
+  "email.oncall.rotation.footer": "This is an automated on-call rotation notification from Taskwondo.",
+  "email.oncall.override.footer": "This is an automated on-call override notification from Taskwondo."
+}
