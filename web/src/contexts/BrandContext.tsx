@@ -2,7 +2,7 @@ import { createContext, useContext } from 'react'
 import type { ReactNode } from 'react'
 import { usePublicSettings } from '@/hooks/useSystemSettings'
 
-const DEFAULT_BRAND_NAME = 'Taskwondo'
+const DEFAULT_BRAND_NAME = 'Baron'
 
 interface BrandContextValue {
   brandName: string

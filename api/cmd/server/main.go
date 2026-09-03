@@ -51,7 +51,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(baseCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Info().Msg("starting taskwondo")
+	log.Info().Msg("starting baron")
 
 	// Connect to database
 	db, err := database.Connect(ctx, cfg.DatabaseURL)

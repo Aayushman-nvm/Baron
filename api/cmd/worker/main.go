@@ -36,7 +36,7 @@ func main() {
 	// graceful-shutdown drain below.
 	ctx, stop := signal.NotifyContext(baseCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Info().Msg("starting taskwondo worker")
+	log.Info().Msg("starting baron worker")
 
 	// Connect to database with worker-specific pool size
 	db, err := database.ConnectWithPool(ctx, cfg.DatabaseURL, cfg.WorkerDBPool, cfg.WorkerDBPool/2+1)
