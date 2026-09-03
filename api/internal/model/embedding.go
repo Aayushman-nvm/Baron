@@ -1,0 +1,94 @@
+package model
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Entity type constants for the embeddings table.
+const (
+	EntityTypeWorkItem   = "work_item"
+	EntityTypeComment    = "comment"
+	EntityTypeProject    = "project"
+	EntityTypeMilestone  = "milestone"
+	EntityTypeQueue      = "queue"
+	EntityTypeAttachment = "attachment"
+	EntityTypeTeam       = "team"
+)
+
+// Embedding represents a vector embedding stored in the database.
+type Embedding struct {
+	ID         uuid.UUID  `json:"id"`
+	EntityType string     `json:"entity_type"`
+	EntityID   uuid.UUID  `json:"entity_id"`
+	ProjectID  *uuid.UUID `json:"project_id,omitempty"`
+	Content    string     `json:"-"`
+	Embedding  []float32  `json:"-"`
+	IndexedAt  time.Time  `json:"indexed_at"`
+}
+
+// EmbedIndexEvent is the NATS payload for embed.index events.
+type EmbedIndexEvent struct {
+	EntityType string    `json:"entity_type"`
+	EntityID   uuid.UUID `json:"entity_id"`
+	ProjectID  *uuid.UUID `json:"project_id,omitempty"`
+}
+
+// EmbedDeleteEvent is the NATS payload for embed.delete events.
+type EmbedDeleteEvent struct {
+	EntityType string    `json:"entity_type"`
+	EntityID   uuid.UUID `json:"entity_id"`
+}
+
+// EmbedBackfillEvent is the NATS payload for embed.backfill events.
+type EmbedBackfillEvent struct {
+	Backfill bool `json:"backfill"`
+}
+
+// SearchResult represents a single result from a semantic search.
+type SearchResult struct {
+	EntityType     string     `json:"entity_type"`
+	EntityID       uuid.UUID  `json:"entity_id"`
+	ProjectID      *uuid.UUID `json:"project_id,omitempty"`
+	Score          float64    `json:"score"`
+	Content        string     `json:"snippet"`
+	ProjectKey     string     `json:"project_key,omitempty"`
+	ItemNumber     *int       `json:"item_number,omitempty"`
+	NamespaceSlug  string     `json:"namespace_slug,omitempty"`
+	ResourcePath   string     `json:"resource_path,omitempty"`
+	Status         string     `json:"status,omitempty"`
+	StatusCategory string     `json:"status_category,omitempty"`
+}
+
+// SearchFilter holds the parameters for a semantic search query.
+type SearchFilter struct {
+	Query       string
+	EntityTypes []string
+	ProjectIDs  []uuid.UUID
+	// ScopeProjectID restricts the project-scoped entity types (work_item,
+	// milestone, queue, team, comment, attachment) to a single project.
+	// Results of type "project" are deliberately left unscoped so a caller can
+	// still discover every project it can see — the command palette relies on
+	// that carve-out to navigate across projects while everything else is
+	// scoped to the current one. Nil means "search everything reachable",
+	// which is the historical behaviour.
+	ScopeProjectID *uuid.UUID
+	Limit          int
+}
+
+// SearchAccess describes a user's RBAC access for search operations. It
+// partitions the user's project memberships into "full access" projects
+// (owner/admin/member/viewer) and "customer" projects. Customer projects
+// are restricted to the user's own portal tickets (and public comments /
+// attachments on those tickets) — no internal data is ever returned.
+type SearchAccess struct {
+	UserID             uuid.UUID
+	FullProjectIDs     []uuid.UUID
+	CustomerProjectIDs []uuid.UUID
+}
+
+// HasAny returns true if the user can see anything across any project.
+func (a SearchAccess) HasAny() bool {
+	return len(a.FullProjectIDs) > 0 || len(a.CustomerProjectIDs) > 0
+}

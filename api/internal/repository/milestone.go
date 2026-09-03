@@ -1,0 +1,319 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/lib/pq"
+
+	"github.com/marcoshack/taskwondo/internal/model"
+)
+
+// MilestoneRepository handles milestone persistence.
+type MilestoneRepository struct {
+	db *sql.DB
+}
+
+// NewMilestoneRepository creates a new MilestoneRepository.
+func NewMilestoneRepository(db *sql.DB) *MilestoneRepository {
+	return &MilestoneRepository{db: db}
+}
+
+// ListAllIDs returns all milestone IDs with pagination (for backfill).
+func (r *MilestoneRepository) ListAllIDs(ctx context.Context, limit, offset int) ([]uuid.UUID, error) {
+	return listAllIDsNoSoftDelete(ctx, r.db, "milestones", limit, offset)
+}
+
+// SearchFTS performs a full-text search on milestones filtered by accessible project IDs.
+func (r *MilestoneRepository) SearchFTS(ctx context.Context, query string, fullProjectIDs []uuid.UUID, limit int) ([]model.SearchResult, error) {
+	if len(fullProjectIDs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT m.id, m.project_id, m.name, m.status,
+		        p.key AS project_key,
+		        COALESCE(n.slug, 'default') AS namespace_slug,
+		        ts_rank(m.search_vector, plainto_tsquery('english', $1)) +
+		        ts_rank(m.search_vector, plainto_tsquery('simple', $1)) AS rank
+		 FROM milestones m
+		 JOIN projects p ON p.id = m.project_id
+		 LEFT JOIN namespaces n ON n.id = p.namespace_id
+		 WHERE (m.search_vector @@ plainto_tsquery('english', $1)
+		     OR m.search_vector @@ plainto_tsquery('simple', $1))
+		   AND m.project_id = ANY($2)
+		 ORDER BY rank DESC, m.updated_at DESC
+		 LIMIT $3`,
+		query, pq.Array(fullProjectIDs), limit)
+	if err != nil {
+		return nil, fmt.Errorf("fts search milestones: %w", err)
+	}
+	defer rows.Close()
+
+	var results []model.SearchResult
+	for rows.Next() {
+		var (
+			id            uuid.UUID
+			projectID     uuid.UUID
+			name          string
+			status        string
+			projectKey    string
+			namespaceSlug string
+			rank          float64
+		)
+		if err := rows.Scan(&id, &projectID, &name, &status, &projectKey, &namespaceSlug, &rank); err != nil {
+			return nil, fmt.Errorf("scanning milestone fts result: %w", err)
+		}
+		_ = rank
+		results = append(results, model.SearchResult{
+			EntityType:    model.EntityTypeMilestone,
+			EntityID:      id,
+			ProjectID:     &projectID,
+			Content:       fmt.Sprintf("Milestone: %s", name),
+			ProjectKey:    projectKey,
+			NamespaceSlug: namespaceSlug,
+			Status:        status,
+		})
+	}
+	return results, rows.Err()
+}
+
+// Create inserts a new milestone.
+func (r *MilestoneRepository) Create(ctx context.Context, m *model.Milestone) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO milestones (id, project_id, name, description, due_date, status)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		m.ID, m.ProjectID, m.Name, m.Description, m.DueDate, m.Status)
+	if err != nil {
+		return fmt.Errorf("inserting milestone: %w", err)
+	}
+	return nil
+}
+
+// GetByID returns a milestone by ID.
+func (r *MilestoneRepository) GetByID(ctx context.Context, id uuid.UUID) (*model.Milestone, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT id, project_id, name, description, due_date, status, created_at, updated_at
+		 FROM milestones WHERE id = $1`, id)
+	return scanMilestone(row)
+}
+
+// GetByIDWithProgress returns a milestone with work item counts.
+func (r *MilestoneRepository) GetByIDWithProgress(ctx context.Context, id uuid.UUID) (*model.MilestoneWithProgress, error) {
+	m, err := r.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return r.attachProgress(ctx, m)
+}
+
+// List returns all milestones for a project.
+func (r *MilestoneRepository) List(ctx context.Context, projectID uuid.UUID) ([]model.Milestone, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, project_id, name, description, due_date, status, created_at, updated_at
+		 FROM milestones WHERE project_id = $1 ORDER BY due_date NULLS LAST, name`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("querying milestones: %w", err)
+	}
+	defer rows.Close()
+
+	return scanMilestones(rows)
+}
+
+// ListWithProgress returns all milestones for a project with work item counts.
+func (r *MilestoneRepository) ListWithProgress(ctx context.Context, projectID uuid.UUID) ([]model.MilestoneWithProgress, error) {
+	milestones, err := r.List(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]model.MilestoneWithProgress, 0, len(milestones))
+	for i := range milestones {
+		mp, err := r.attachProgress(ctx, &milestones[i])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *mp)
+	}
+	return result, nil
+}
+
+// Update modifies a milestone's mutable fields.
+func (r *MilestoneRepository) Update(ctx context.Context, m *model.Milestone) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE milestones SET name = $1, description = $2, due_date = $3, status = $4, updated_at = now()
+		 WHERE id = $5`,
+		m.Name, m.Description, m.DueDate, m.Status, m.ID)
+	if err != nil {
+		return fmt.Errorf("updating milestone: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected: %w", err)
+	}
+	if n == 0 {
+		return model.ErrNotFound
+	}
+	return nil
+}
+
+// Delete removes a milestone.
+func (r *MilestoneRepository) Delete(ctx context.Context, id uuid.UUID) error {
+	result, err := r.db.ExecContext(ctx,
+		`DELETE FROM milestones WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("deleting milestone: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected: %w", err)
+	}
+	if n == 0 {
+		return model.ErrNotFound
+	}
+	return nil
+}
+
+// Stats returns aggregate counts by type, priority, and label for a milestone's work items.
+func (r *MilestoneRepository) Stats(ctx context.Context, milestoneID uuid.UUID) (*model.MilestoneStats, error) {
+	stats := &model.MilestoneStats{
+		ByType:     make(map[string]model.StatusCount),
+		ByPriority: make(map[string]model.StatusCount),
+		ByLabel:    make(map[string]int),
+	}
+
+	// Counts by type and priority
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT wi.type, wi.priority,
+			COUNT(*) FILTER (WHERE wi.resolved_at IS NULL) AS open_count,
+			COUNT(*) FILTER (WHERE wi.resolved_at IS NOT NULL) AS closed_count
+		 FROM work_items wi
+		 WHERE wi.milestone_id = $1 AND wi.deleted_at IS NULL
+		 GROUP BY wi.type, wi.priority`, milestoneID)
+	if err != nil {
+		return nil, fmt.Errorf("querying milestone stats: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var typ, priority string
+		var openCount, closedCount int
+		if err := rows.Scan(&typ, &priority, &openCount, &closedCount); err != nil {
+			return nil, fmt.Errorf("scanning milestone stats row: %w", err)
+		}
+
+		tc := stats.ByType[typ]
+		tc.Open += openCount
+		tc.Closed += closedCount
+		stats.ByType[typ] = tc
+
+		pc := stats.ByPriority[priority]
+		pc.Open += openCount
+		pc.Closed += closedCount
+		stats.ByPriority[priority] = pc
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating milestone stats: %w", err)
+	}
+
+	// Counts by label
+	labelRows, err := r.db.QueryContext(ctx,
+		`SELECT label, COUNT(*) AS count
+		 FROM work_items wi, unnest(wi.labels) AS label
+		 WHERE wi.milestone_id = $1 AND wi.deleted_at IS NULL
+		 GROUP BY label
+		 ORDER BY count DESC`, milestoneID)
+	if err != nil {
+		return nil, fmt.Errorf("querying milestone label stats: %w", err)
+	}
+	defer labelRows.Close()
+
+	for labelRows.Next() {
+		var label string
+		var count int
+		if err := labelRows.Scan(&label, &count); err != nil {
+			return nil, fmt.Errorf("scanning milestone label stats row: %w", err)
+		}
+		stats.ByLabel[label] = count
+	}
+	if err := labelRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating milestone label stats: %w", err)
+	}
+
+	return stats, nil
+}
+
+func (r *MilestoneRepository) attachProgress(ctx context.Context, m *model.Milestone) (*model.MilestoneWithProgress, error) {
+	mp := &model.MilestoneWithProgress{Milestone: *m}
+
+	err := r.db.QueryRowContext(ctx,
+		`SELECT
+			COUNT(*) FILTER (WHERE wi.resolved_at IS NULL) AS open_count,
+			COUNT(*) FILTER (WHERE wi.resolved_at IS NOT NULL) AS closed_count,
+			COUNT(*) AS total_count,
+			COALESCE(SUM(wi.estimated_seconds), 0) AS total_estimated_seconds,
+			COALESCE((
+				SELECT SUM(te.duration_seconds)
+				FROM time_entries te
+				WHERE te.work_item_id IN (
+					SELECT wi2.id FROM work_items wi2
+					WHERE wi2.milestone_id = $1 AND wi2.deleted_at IS NULL
+				) AND te.deleted_at IS NULL
+			), 0) AS total_spent_seconds
+		 FROM work_items wi
+		 WHERE wi.milestone_id = $1 AND wi.deleted_at IS NULL`, m.ID).
+		Scan(&mp.OpenCount, &mp.ClosedCount, &mp.TotalCount, &mp.TotalEstimatedSeconds, &mp.TotalSpentSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("counting milestone progress: %w", err)
+	}
+
+	return mp, nil
+}
+
+func scanMilestone(row *sql.Row) (*model.Milestone, error) {
+	var m model.Milestone
+	var description sql.NullString
+	var dueDate sql.NullTime
+
+	err := row.Scan(&m.ID, &m.ProjectID, &m.Name, &description, &dueDate, &m.Status, &m.CreatedAt, &m.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, model.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scanning milestone: %w", err)
+	}
+
+	if description.Valid {
+		m.Description = &description.String
+	}
+	if dueDate.Valid {
+		m.DueDate = &dueDate.Time
+	}
+
+	return &m, nil
+}
+
+func scanMilestones(rows *sql.Rows) ([]model.Milestone, error) {
+	var milestones []model.Milestone
+	for rows.Next() {
+		var m model.Milestone
+		var description sql.NullString
+		var dueDate sql.NullTime
+
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.Name, &description, &dueDate, &m.Status, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scanning milestone row: %w", err)
+		}
+
+		if description.Valid {
+			m.Description = &description.String
+		}
+		if dueDate.Valid {
+			m.DueDate = &dueDate.Time
+		}
+
+		milestones = append(milestones, m)
+	}
+	return milestones, rows.Err()
+}
