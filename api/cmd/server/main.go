@@ -1,0 +1,886 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/time/rate"
+
+	"github.com/marcoshack/taskwondo/internal/config"
+	"github.com/marcoshack/taskwondo/internal/crypto"
+	"github.com/marcoshack/taskwondo/internal/database"
+	"github.com/marcoshack/taskwondo/internal/email"
+	"github.com/marcoshack/taskwondo/internal/handler"
+	applog "github.com/marcoshack/taskwondo/internal/log"
+	"github.com/marcoshack/taskwondo/internal/metrics"
+	"github.com/marcoshack/taskwondo/internal/middleware"
+	"github.com/marcoshack/taskwondo/internal/model"
+	"github.com/marcoshack/taskwondo/internal/repository"
+	"github.com/marcoshack/taskwondo/internal/service"
+	"github.com/marcoshack/taskwondo/internal/storage"
+	"github.com/marcoshack/taskwondo/internal/workers"
+)
+
+// commitSHA is set at build time via -ldflags.
+var commitSHA = "dev"
+
+func main() {
+	migrateOnly := flag.Bool("migrate-only", false, "Run migrations and exit")
+	flag.Parse()
+
+	// Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to load configuration")
+	}
+
+	// Configure logger
+	applog.Setup(cfg.LogLevel, cfg.LogFormat, "api")
+
+	baseCtx := log.Logger.WithContext(context.Background())
+	// Cancel ctx on SIGINT (Ctrl+C) / SIGTERM so startup and the request loop
+	// alike observe shutdown; baseCtx stays live for the graceful-shutdown path.
+	ctx, stop := signal.NotifyContext(baseCtx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Info().Msg("starting taskwondo")
+
+	// Connect to database
+	db, err := database.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to connect to database")
+	}
+	defer db.Close()
+
+	log.Info().Msg("connected to database")
+
+	// Register metrics collectors
+	metrics.RegisterCollector(metrics.NewDBCollector(db))
+	metrics.RegisterCollector(metrics.NewResourceCollector(db))
+
+	// Run migrations
+	if err := database.Migrate(ctx, db); err != nil {
+		log.Fatal().Err(err).Msg("failed to run migrations")
+	}
+
+	if *migrateOnly {
+		log.Info().Msg("migrations complete, exiting")
+		return
+	}
+
+	// Initialize repositories
+	userRepo := repository.NewUserRepository(db)
+	apiKeyRepo := repository.NewAPIKeyRepository(db)
+	projectRepo := repository.NewProjectRepository(db)
+	projectMemberRepo := repository.NewProjectMemberRepository(db)
+	workItemRepo := repository.NewWorkItemRepository(db)
+	workItemEventRepo := repository.NewWorkItemEventRepository(db)
+	commentRepo := repository.NewCommentRepository(db)
+	descriptionRevisionRepo := repository.NewDescriptionRevisionRepository(db)
+	relationRepo := repository.NewWorkItemRelationRepository(db)
+	workflowRepo := repository.NewWorkflowRepository(db)
+	queueRepo := repository.NewQueueRepository(db)
+	queueCategoryRepo := repository.NewQueueCategoryRepository(db)
+	queueTeamRepo := repository.NewQueueTeamRepository(db)
+	teamRepo := repository.NewTeamRepository(db)
+	savedSearchRepo := repository.NewSavedSearchRepository(db)
+	milestoneRepo := repository.NewMilestoneRepository(db)
+	userSettingRepo := repository.NewUserSettingRepository(db)
+	systemSettingRepo := repository.NewSystemSettingRepository(db)
+	attachmentRepo := repository.NewAttachmentRepository(db)
+	timeEntryRepo := repository.NewTimeEntryRepository(db)
+	inboxRepo := repository.NewInboxRepository(db)
+	oauthAccountRepo := repository.NewOAuthAccountRepository(db)
+	typeWorkflowRepo := repository.NewProjectTypeWorkflowRepository(db)
+	inviteRepo := repository.NewInviteRepository(db)
+	slaRepo := repository.NewSLARepository(db)
+	escalationRepo := repository.NewEscalationRepository(db)
+	watcherRepo := repository.NewWatcherRepository(db)
+	emailVerificationRepo := repository.NewEmailVerificationRepository(db)
+	passwordResetRepo := repository.NewPasswordResetRepository(db)
+	statsRepo := repository.NewStatsRepository(db)
+	embeddingRepo := repository.NewEmbeddingRepository(db)
+	namespaceRepo := repository.NewNamespaceRepository(db)
+	namespaceMemberRepo := repository.NewNamespaceMemberRepository(db)
+
+	// Initialize storage
+	store, err := storage.NewMinIOStorage(
+		cfg.StorageEndpoint, cfg.StorageAccessKey, cfg.StorageSecretKey,
+		cfg.StorageBucket, cfg.StorageRegion, cfg.StorageUseSSL,
+	)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize storage")
+	}
+
+	// Initialize services
+	// Build OAuth providers from config
+	var oauthProviders []service.OAuthProvider
+	if cfg.DiscordClientID != "" && cfg.DiscordClientSecret != "" {
+		oauthProviders = append(oauthProviders, service.NewDiscordProvider(
+			cfg.DiscordClientID, cfg.DiscordClientSecret, cfg.BaseURL+"/auth/discord/callback", nil,
+		))
+	}
+	if cfg.GoogleClientID != "" && cfg.GoogleClientSecret != "" {
+		oauthProviders = append(oauthProviders, service.NewGoogleProvider(
+			cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.BaseURL+"/auth/google/callback", nil,
+		))
+	}
+	if cfg.GitHubClientID != "" && cfg.GitHubClientSecret != "" {
+		oauthProviders = append(oauthProviders, service.NewGitHubProvider(
+			cfg.GitHubClientID, cfg.GitHubClientSecret, cfg.BaseURL+"/auth/github/callback", nil,
+		))
+	}
+	if cfg.MicrosoftClientID != "" && cfg.MicrosoftClientSecret != "" {
+		oauthProviders = append(oauthProviders, service.NewMicrosoftProvider(
+			cfg.MicrosoftClientID, cfg.MicrosoftClientSecret, cfg.BaseURL+"/auth/microsoft/callback", nil,
+		))
+	}
+
+	authService := service.NewAuthService(
+		userRepo, apiKeyRepo, oauthAccountRepo,
+		cfg.JWTSecret, cfg.JWTExpiry,
+		oauthProviders,
+	)
+	projectService := service.NewProjectService(projectRepo, projectMemberRepo, userRepo, workflowRepo, typeWorkflowRepo, systemSettingRepo, inviteRepo, inboxRepo, watcherRepo, userSettingRepo)
+	workflowService := service.NewWorkflowService(workflowRepo)
+	queueService := service.NewQueueService(queueRepo, queueCategoryRepo, queueTeamRepo, projectRepo, projectMemberRepo)
+	teamService := service.NewTeamService(teamRepo, projectRepo, projectMemberRepo)
+	oncallRepo := repository.NewOncallRotationRepository(db)
+	oncallOverrideRepo := repository.NewOncallOverrideRepository(db)
+	oncallService := service.NewOncallService(oncallRepo, teamRepo, projectRepo, projectMemberRepo)
+	oncallService.SetOverrideRepository(oncallOverrideRepo)
+	savedSearchService := service.NewSavedSearchService(savedSearchRepo, projectRepo, projectMemberRepo)
+	milestoneService := service.NewMilestoneService(milestoneRepo, projectRepo, projectMemberRepo)
+	slaService := service.NewSLAService(slaRepo, projectRepo, projectMemberRepo, workflowRepo)
+	slaService.SetBackfiller(workItemRepo)
+	escalationService := service.NewEscalationService(escalationRepo, projectRepo, projectMemberRepo, userRepo)
+	workItemService := service.NewWorkItemService(
+		service.WithWorkItemRepos(workItemRepo, workItemEventRepo, commentRepo, relationRepo, attachmentRepo, timeEntryRepo, watcherRepo),
+		service.WithProjectContext(projectRepo, projectMemberRepo, workflowRepo, typeWorkflowRepo, queueRepo, milestoneRepo),
+		service.WithSLA(slaRepo, slaService),
+		service.WithStorage(store, cfg.MaxUploadSize),
+		service.WithDescriptionRevisions(descriptionRevisionRepo),
+	)
+	inboxService := service.NewInboxService(inboxRepo, projectMemberRepo)
+	userSettingService := service.NewUserSettingService(userSettingRepo, projectRepo, projectMemberRepo)
+	systemSettingService := service.NewSystemSettingService(systemSettingRepo)
+	namespaceService := service.NewNamespaceService(namespaceRepo, namespaceMemberRepo, projectRepo, projectMemberRepo, userRepo, systemSettingRepo, userSettingRepo, inviteRepo)
+	adminRepo := repository.NewAdminRepository(db)
+	adminService := service.NewAdminService(userRepo, projectRepo, projectMemberRepo, adminRepo)
+	statsService := service.NewStatsService(statsRepo, projectRepo, projectMemberRepo)
+
+	// Initialize embedding and search services
+	embeddingService := service.NewEmbeddingService(cfg.OllamaURL, cfg.OllamaModel)
+	searchService := service.NewSearchService(embeddingService, embeddingRepo, workItemRepo, teamRepo, queueRepo, milestoneRepo, projectMemberRepo, systemSettingRepo)
+
+	// Seed admin user if configured
+	if cfg.AdminEmail != "" && cfg.AdminPassword != "" {
+		if err := authService.SeedAdminUser(ctx, cfg.AdminEmail, cfg.AdminPassword); err != nil {
+			log.Fatal().Err(err).Msg("failed to seed admin user")
+		}
+	}
+
+	// Seed default workflows
+	if err := workflowService.SeedDefaultWorkflows(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to seed default workflows")
+	}
+
+	// Seed default type-workflow setting
+	if err := projectService.SeedDefaultTypeWorkflows(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to seed default type workflows")
+	}
+
+	// Backfill type-workflow mappings for existing projects
+	if err := projectService.SeedExistingProjectTypeWorkflows(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to seed existing project type workflows")
+	}
+
+	// Seed default namespace and backfill existing projects
+	if err := namespaceService.SeedDefaultNamespace(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to seed default namespace")
+	}
+
+	// Seed default limit settings (max projects/namespaces per user)
+	if err := systemSettingService.SeedDefaultLimits(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to seed default limit settings")
+	}
+
+	// Seed default deny lists (reserved namespace slugs and project keys)
+	if err := systemSettingService.SeedDefaultDenyLists(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to seed default deny lists")
+	}
+
+	// Sync default namespace display name when brand changes
+	systemSettingService.SetBrandChangeHandler(namespaceService.UpdateDefaultNamespaceDisplayName)
+
+	// Initialize encryption
+	var encKey []byte
+	if cfg.EncryptionKey != "" {
+		encKey = []byte(cfg.EncryptionKey)
+		if len(encKey) != 32 {
+			log.Fatal().Msg("ENCRYPTION_KEY must be exactly 32 bytes")
+		}
+	} else {
+		var err error
+		encKey, err = crypto.DeriveKey(cfg.JWTSecret)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to derive encryption key")
+		}
+	}
+	encryptor, err := crypto.NewEncryptor(encKey)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create encryptor")
+	}
+
+	// Initialize email sender
+	emailSender := email.NewSender(encryptor, systemSettingRepo)
+
+	// Configure email verification on auth service
+	authService.SetEmailVerification(emailVerificationRepo, systemSettingRepo, emailSender, cfg.BaseURL)
+	authService.SetPasswordReset(passwordResetRepo)
+
+	// Configure encryptor on auth service (for decrypting OAuth secrets from DB)
+	authService.SetEncryptor(encryptor)
+
+	// Configure storage for avatar uploads
+	authService.SetStorage(store)
+
+	// Seed OAuth config from env vars if not already in DB
+	seedOAuthConfig(ctx, systemSettingRepo, encryptor, cfg)
+
+	// Connect to NATS for event publishing (optional — notifications degrade gracefully)
+	publisher, natsCleanup := initEventPublisher(cfg.NatsURL)
+	defer natsCleanup()
+	workItemService.SetPublisher(publisher)
+	projectService.SetPublisher(publisher)
+	milestoneService.SetPublisher(publisher)
+	queueService.SetPublisher(publisher)
+	systemSettingService.SetPublisher(publisher)
+	oncallService.SetPublisher(publisher)
+	teamService.SetPublisher(publisher)
+	namespaceService.SetPublisher(publisher)
+
+	// Wire SLA notification repository for clearing notifications on status transitions
+	slaNotificationRepo := repository.NewSLANotificationRepository(db)
+	workItemService.SetSLANotifications(slaNotificationRepo)
+
+	// Set up embed feature flag cache (shared across services, 60s TTL)
+	embedCache := service.NewFeatureFlagCache(model.SettingFeatureSemanticSearch, 60*time.Second, systemSettingRepo)
+	workItemService.SetEmbedCache(embedCache)
+	projectService.SetEmbedCache(embedCache)
+	milestoneService.SetEmbedCache(embedCache)
+	queueService.SetEmbedCache(embedCache)
+	teamService.SetEmbedCache(embedCache)
+
+	// Start Ollama availability probe (background goroutine)
+	go func() {
+		probeAndWrite := func() {
+			available, _ := embeddingService.Probe(ctx)
+			val, _ := json.Marshal(available)
+			_ = systemSettingRepo.Upsert(ctx, &model.SystemSetting{
+				Key:   model.SettingOllamaAvailable,
+				Value: val,
+			})
+		}
+		probeAndWrite() // Run immediately on startup
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				probeAndWrite()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Initialize handlers
+	health := handler.NewHealthHandler(db, commitSHA)
+	auth := handler.NewAuthHandler(authService, projectService, projectMemberRepo, namespaceMemberRepo)
+	projects := handler.NewProjectHandler(projectService, cfg.BaseURL)
+	workflows := handler.NewWorkflowHandler(workflowService, projectService)
+	queues := handler.NewQueueHandler(queueService)
+	teams := handler.NewTeamHandler(teamService)
+	oncall := handler.NewOncallHandler(oncallService)
+	savedSearches := handler.NewSavedSearchHandler(savedSearchService)
+	milestones := handler.NewMilestoneHandler(milestoneService)
+	items := handler.NewWorkItemHandler(workItemService, slaService, cfg.MaxUploadSize, cfg.BaseURL)
+	userSettings := handler.NewUserSettingHandler(userSettingService)
+	systemSettings := handler.NewSystemSettingHandler(systemSettingService, encryptor, emailSender, cfg.MaxUploadSize)
+	admin := handler.NewAdminHandler(adminService)
+	sla := handler.NewSLAHandler(slaService)
+	escalations := handler.NewEscalationHandler(escalationService)
+	inbox := handler.NewInboxHandler(inboxService, slaService)
+	stats := handler.NewStatsHandler(statsService)
+	search := handler.NewSearchHandler(searchService)
+	namespaces := handler.NewNamespaceHandler(namespaceService, cfg.BaseURL)
+	invites := handler.NewInviteHandler(projectService, namespaceService)
+	portal := handler.NewPortalHandler(workItemService, queueService, authService, cfg.MaxUploadSize)
+
+	metricsHandler := handler.NewMetricsHandler()
+
+	// Set up router
+	r := chi.NewRouter()
+
+	// Global middleware
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Logging(log.Logger))
+	r.Use(middleware.Recovery)
+	r.Use(middleware.CORS(cfg.BaseURL))
+	r.Use(middleware.SecurityHeaders)
+	r.Use(middleware.BodyLimit(1 << 20)) // 1MB limit for non-multipart requests
+	r.Use(middleware.Metrics)
+
+	// Health checks (unauthenticated)
+	r.Get("/healthz", health.Healthz)
+	r.Get("/readyz", health.Readyz)
+
+	// Prometheus metrics (authenticated via system API key)
+	r.With(middleware.Auth(authService)).Get("/metrics", metricsHandler.ServeHTTP)
+
+	// API v1 routes
+	r.Route("/api/v1", func(r chi.Router) {
+		// Public auth routes (rate-limited)
+		authLimiter := middleware.RateLimit(rate.Limit(cfg.AuthRateLimit)/60, cfg.AuthRateBurst)
+		r.With(authLimiter).Post("/auth/login", auth.Login)
+		r.With(authLimiter).Post("/auth/register", auth.Register)
+		r.With(authLimiter).Post("/auth/verify-email", auth.VerifyEmail)
+		r.With(authLimiter).Post("/auth/forgot-password", auth.ForgotPassword)
+		r.With(authLimiter).Post("/auth/reset-password", auth.ResetPassword)
+		r.Get("/auth/providers", auth.AuthProviders)
+		// Rate-limited: the OAuth URL endpoint creates a signed state token and
+		// hits the configured providers per-call. Unlimited invocations could
+		// be used to probe provider availability or exhaust state storage.
+		r.With(authLimiter).Get("/auth/{provider}", auth.OAuthAuth)
+		r.With(authLimiter).Post("/auth/{provider}/callback", auth.OAuthCallback)
+
+		// Public settings (unauthenticated)
+		r.Get("/settings/public", systemSettings.GetPublic)
+
+		// Public invite info (unauthenticated) — resolves project or namespace invites.
+		// Rate-limited to prevent enumeration of valid invite codes.
+		r.With(authLimiter).Get("/invites/{code}", invites.GetInviteInfo)
+
+		// Public avatar serving (loaded by <img> tags which can't send JWT)
+		r.Get("/users/{userId}/avatar", auth.GetUserAvatar)
+
+		// Authenticated routes
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Auth(authService))
+
+			r.Post("/auth/refresh", auth.Refresh)
+			r.Post("/auth/logout", auth.Logout)
+			r.Get("/auth/me", auth.Me)
+			r.Post("/auth/change-password", auth.ChangePassword)
+
+			// User profile
+			r.Patch("/user/profile", auth.UpdateProfile)
+			r.Post("/user/avatar", auth.UploadAvatar)
+			r.Delete("/user/avatar", auth.DeleteAvatar)
+
+			// API key management
+			r.Get("/user/api-keys", auth.ListAPIKeys)
+			r.Post("/user/api-keys", auth.CreateAPIKey)
+			r.Patch("/user/api-keys/{keyId}", auth.RenameAPIKey)
+			r.Delete("/user/api-keys/{keyId}", auth.DeleteAPIKey)
+
+			// Connected OAuth accounts
+			r.Get("/user/connected-accounts", auth.ListConnectedAccounts)
+			r.Delete("/user/connected-accounts/{accountId}", auth.UnlinkConnectedAccount)
+
+			// Global user preferences
+			r.Route("/user/preferences", func(r chi.Router) {
+				r.Get("/", userSettings.ListGlobal)
+				r.Route("/{key}", func(r chi.Router) {
+					r.Get("/", userSettings.GetGlobal)
+					r.Put("/", userSettings.SetGlobal)
+					r.Delete("/", userSettings.DeleteGlobal)
+				})
+			})
+
+			// User inbox
+			r.Route("/user/inbox", func(r chi.Router) {
+				r.Get("/", inbox.List)
+				r.Post("/", inbox.Add)
+				r.Get("/count", inbox.Count)
+				r.Delete("/completed", inbox.ClearCompleted)
+				r.Route("/{inboxItemId}", func(r chi.Router) {
+					r.Delete("/", inbox.Remove)
+					r.Patch("/", inbox.Reorder)
+				})
+			})
+
+			// User watchlist
+			r.Get("/user/watchlist", items.ListWatchedItemIDs)
+
+			// User search (scoped to co-project members)
+			r.Get("/users", auth.SearchUsers)
+			r.Get("/users/search", auth.SearchUsersDeprecated) // deprecated — use /users
+
+			// Accept invite (authenticated) — resolves project or namespace invites
+			r.Post("/invites/{code}/accept", invites.AcceptInvite)
+
+			// Semantic search
+			r.Get("/search", search.Search)
+
+			// Namespaces
+			r.Route("/namespaces", func(r chi.Router) {
+				r.Get("/", namespaces.List)
+				r.Post("/", namespaces.Create)
+				r.Route("/{slug}", func(r chi.Router) {
+					r.Get("/", namespaces.Get)
+					r.Patch("/", namespaces.Update)
+					r.Delete("/", namespaces.Delete)
+					r.Route("/members", func(r chi.Router) {
+						r.Get("/", namespaces.ListMembers)
+						r.Post("/", namespaces.AddMember)
+						r.Put("/{userId}", namespaces.UpdateMemberRole)
+						r.Delete("/{userId}", namespaces.RemoveMember)
+					})
+					r.Route("/invites", func(r chi.Router) {
+						r.Get("/", namespaces.ListInvites)
+						r.Post("/", namespaces.CreateInvite)
+						r.Delete("/{inviteId}", namespaces.DeleteInvite)
+					})
+					r.Post("/projects/{projectKey}/migrate", namespaces.MigrateProject)
+				})
+			})
+
+			// Projects (cross-namespace, no namespace middleware — returns all projects)
+			r.Get("/"+handler.PathProjects, projects.List)
+
+			// Projects (namespace-scoped)
+			r.Route("/{namespace}/"+handler.PathProjects, func(r chi.Router) {
+				r.Use(middleware.Namespace(namespaceService))
+				r.Get("/", projects.List)
+				r.Post("/", projects.Create)
+				r.Route("/{projectKey}", func(r chi.Router) {
+					// User settings (e.g. notifications preferences) must be accessible
+					// to every project member, including users with the customer role,
+					// so they are registered outside the ExcludeCustomer group below.
+					r.Route("/"+handler.PathUserSettings, func(r chi.Router) {
+						r.Get("/", userSettings.List)
+						r.Route("/{key}", func(r chi.Router) {
+							r.Get("/", userSettings.Get)
+							r.Put("/", userSettings.Set)
+							r.Delete("/", userSettings.Delete)
+						})
+					})
+
+					// All other project-scoped routes exclude customer role users.
+					r.Group(func(r chi.Router) {
+						r.Use(middleware.ExcludeCustomer(projectRepo, projectMemberRepo))
+						r.Get("/", projects.Get)
+						r.Patch("/", projects.Update)
+						r.Delete("/", projects.Delete)
+						r.Route("/"+handler.PathMembers, func(r chi.Router) {
+							r.Get("/", projects.ListMembers)
+							r.Post("/", projects.AddMember)
+							r.Patch("/{userId}", projects.UpdateMemberRole)
+							r.Delete("/{userId}", projects.RemoveMember)
+						})
+						r.Route("/"+handler.PathInvites, func(r chi.Router) {
+							r.Get("/", projects.ListInvites)
+							r.Post("/", projects.CreateInvite)
+							r.Delete("/{inviteId}", projects.DeleteInvite)
+						})
+						r.Route("/"+handler.PathTypeWorkflows, func(r chi.Router) {
+							r.Get("/", projects.ListTypeWorkflows)
+							r.Put("/{type}", projects.UpdateTypeWorkflow)
+						})
+						r.Route("/"+handler.PathWorkflows, func(r chi.Router) {
+							r.Get("/", workflows.ListProjectWorkflows)
+							r.Get("/statuses", workflows.ListAvailableStatuses)
+							r.Post("/", workflows.CreateProjectWorkflow)
+							r.Route("/{workflowId}", func(r chi.Router) {
+								r.Get("/", workflows.GetProjectWorkflow)
+								r.Patch("/", workflows.UpdateProjectWorkflow)
+								r.Delete("/", workflows.DeleteProjectWorkflow)
+							})
+						})
+						r.Route("/"+handler.PathQueues, func(r chi.Router) {
+							r.Get("/", queues.List)
+							r.Post("/", queues.Create)
+							r.Route("/{queueId}", func(r chi.Router) {
+								r.Get("/", queues.Get)
+								r.Patch("/", queues.Update)
+								r.Delete("/", queues.Delete)
+								r.Route("/categories", func(r chi.Router) {
+									r.Get("/", queues.ListCategories)
+									r.Post("/", queues.CreateCategory)
+									r.Route("/{categoryId}", func(r chi.Router) {
+										r.Patch("/", queues.UpdateCategory)
+										r.Delete("/", queues.DeleteCategory)
+									})
+								})
+								r.Route("/teams", func(r chi.Router) {
+									r.Get("/", queues.ListQueueTeams)
+									r.Post("/", queues.AssignQueueTeam)
+									r.Delete("/{teamId}", queues.UnassignQueueTeam)
+								})
+							})
+						})
+						r.Route("/"+handler.PathTeams, func(r chi.Router) {
+							r.Get("/", teams.List)
+							r.Post("/", teams.Create)
+							r.Route("/{teamId}", func(r chi.Router) {
+								r.Get("/", teams.Get)
+								r.Patch("/", teams.Update)
+								r.Delete("/", teams.Delete)
+								r.Route("/members", func(r chi.Router) {
+									r.Get("/", teams.ListMembers)
+									r.Post("/", teams.AddMember)
+									r.Delete("/{userId}", teams.RemoveMember)
+								})
+								r.Route("/"+handler.PathOncall, func(r chi.Router) {
+									r.Get("/", oncall.Get)
+									r.Post("/", oncall.Create)
+									r.Patch("/", oncall.Update)
+									r.Delete("/", oncall.Delete)
+									r.Get("/history", oncall.ListHistory)
+									r.Route("/overrides", func(r chi.Router) {
+										r.Post("/", oncall.CreateOverride)
+										r.Get("/", oncall.ListOverrides)
+										r.Route("/{overrideId}", func(r chi.Router) {
+											r.Patch("/", oncall.UpdateOverride)
+											r.Delete("/", oncall.DeleteOverride)
+										})
+									})
+								})
+							})
+						})
+						r.Route("/"+handler.PathSavedSearches, func(r chi.Router) {
+							r.Get("/", savedSearches.List)
+							r.Post("/", savedSearches.Create)
+							r.Route("/{searchId}", func(r chi.Router) {
+								r.Patch("/", savedSearches.Update)
+								r.Delete("/", savedSearches.Delete)
+							})
+						})
+						r.Route("/"+handler.PathSLATargets, func(r chi.Router) {
+							r.Get("/", sla.List)
+							r.Put("/", sla.BulkUpsert)
+							r.Delete("/{targetId}", sla.Delete)
+						})
+						r.Route("/"+handler.PathEscalationLists, func(r chi.Router) {
+							r.Get("/", escalations.List)
+							r.Post("/", escalations.Create)
+							r.Get("/mappings", escalations.ListMappings)
+							r.Put("/mappings/{type}", escalations.UpdateMapping)
+							r.Delete("/mappings/{type}", escalations.DeleteMapping)
+							r.Route("/{listId}", func(r chi.Router) {
+								r.Get("/", escalations.Get)
+								r.Put("/", escalations.Update)
+								r.Delete("/", escalations.Delete)
+							})
+						})
+						r.Route("/"+handler.PathMilestones, func(r chi.Router) {
+							r.Get("/", milestones.List)
+							r.Post("/", milestones.Create)
+							r.Route("/{milestoneId}", func(r chi.Router) {
+								r.Get("/", milestones.Get)
+								r.Patch("/", milestones.Update)
+								r.Delete("/", milestones.Delete)
+								r.Get("/stats", milestones.Stats)
+							})
+						})
+						r.Route("/"+handler.PathStats, func(r chi.Router) {
+							r.Get("/timeline", stats.Timeline)
+						})
+						r.Route("/"+handler.PathItems, func(r chi.Router) {
+							r.Get("/", items.List)
+							r.Post("/", items.Create)
+							r.Route("/{itemNumber}", func(r chi.Router) {
+								r.Get("/", items.Get)
+								r.Patch("/", items.Update)
+								r.Delete("/", items.Delete)
+								r.Route("/"+handler.PathComments, func(r chi.Router) {
+									r.Get("/", items.ListComments)
+									r.Post("/", items.CreateComment)
+									r.Patch("/{commentId}", items.UpdateComment)
+									r.Delete("/{commentId}", items.DeleteComment)
+								})
+								r.Route("/"+handler.PathDescriptionRevisions, func(r chi.Router) {
+									r.Get("/", items.ListDescriptionRevisions)
+									r.Get("/{revId}", items.GetDescriptionRevision)
+								})
+								r.Route("/"+handler.PathRelations, func(r chi.Router) {
+									r.Get("/", items.ListRelations)
+									r.Post("/", items.CreateRelation)
+									r.Delete("/{relationId}", items.DeleteRelation)
+								})
+								r.Route("/"+handler.PathAttachments, func(r chi.Router) {
+									r.Get("/", items.ListAttachments)
+									r.Post("/", items.UploadAttachment)
+									r.Get("/{attachmentId}", items.DownloadAttachment)
+									r.Patch("/{attachmentId}", items.UpdateAttachmentComment)
+									r.Delete("/{attachmentId}", items.DeleteAttachment)
+								})
+								r.Route("/"+handler.PathTimeEntries, func(r chi.Router) {
+									r.Get("/", items.ListTimeEntries)
+									r.Post("/", items.CreateTimeEntry)
+									r.Patch("/{timeEntryId}", items.UpdateTimeEntry)
+									r.Delete("/{timeEntryId}", items.DeleteTimeEntry)
+								})
+								r.Route("/"+handler.PathWatchers, func(r chi.Router) {
+									r.Get("/", items.ListWatchers)
+									r.Post("/", items.AddWatcher)
+									r.Delete("/{userId}", items.RemoveWatcher)
+								})
+								r.Post("/watch", items.ToggleWatch)
+								r.Get("/"+handler.PathEvents, items.ListEvents)
+							})
+						})
+					})
+				})
+			})
+
+			// Portal routes (customer-facing)
+			r.Route("/portal/{namespace}/projects/{projectKey}", func(r chi.Router) {
+				r.Get("/queues", portal.ListQueues)
+				r.Route("/tickets", func(r chi.Router) {
+					r.Post("/", portal.CreateTicket)
+					r.Get("/", portal.ListTickets)
+					r.Route("/{itemNumber}", func(r chi.Router) {
+						r.Get("/", portal.GetTicket)
+						r.Patch("/", portal.UpdateTicket)
+						r.Get("/comments", portal.ListComments)
+						r.Post("/comments", portal.AddComment)
+						r.Get("/events", portal.ListEvents)
+						r.Route("/attachments", func(r chi.Router) {
+							r.Get("/", portal.ListAttachments)
+							r.Post("/", portal.UploadAttachment)
+							r.Get("/{attachmentId}", portal.DownloadAttachment)
+							r.Patch("/{attachmentId}", portal.UpdateAttachmentComment)
+							r.Delete("/{attachmentId}", portal.DeleteAttachment)
+						})
+					})
+				})
+			})
+
+			// Admin routes (requires admin role)
+			r.Route("/admin", func(r chi.Router) {
+				r.Use(middleware.RequireAdmin)
+				r.Route("/api-keys", func(r chi.Router) {
+					r.Get("/", auth.ListSystemAPIKeys)
+					r.Post("/", auth.CreateSystemAPIKey)
+					r.Patch("/{keyId}", auth.RenameSystemAPIKey)
+					r.Delete("/{keyId}", auth.DeleteSystemAPIKey)
+				})
+				r.Route("/workflows", func(r chi.Router) {
+					r.Get("/", workflows.List)
+					r.Get("/statuses", workflows.ListSystemStatuses)
+					r.Post("/", workflows.Create)
+					r.Route("/{workflowId}", func(r chi.Router) {
+						r.Get("/", workflows.Get)
+						r.Get("/transitions", workflows.ListTransitions)
+						r.Patch("/", workflows.Update)
+						r.Delete("/", workflows.Delete)
+					})
+				})
+				r.Route("/users", func(r chi.Router) {
+					r.Get("/", admin.ListUsers)
+					r.Post("/", admin.CreateUser)
+					r.Route("/{userId}", func(r chi.Router) {
+						r.Patch("/", admin.UpdateUser)
+						r.Post("/reset-password", admin.ResetUserPassword)
+						r.Route("/projects", func(r chi.Router) {
+							r.Get("/", admin.ListUserProjects)
+							r.Post("/", admin.AddUserToProject)
+							r.Patch("/{projectId}", admin.UpdateUserProjectRole)
+							r.Delete("/{projectId}", admin.RemoveUserFromProject)
+						})
+					})
+				})
+				r.Get("/stats", admin.GetStats)
+				r.Get("/projects", admin.ListAllProjects)
+				r.Get("/namespaces", admin.ListAllNamespaces)
+				r.Route("/settings", func(r chi.Router) {
+					r.Get("/", systemSettings.List)
+					r.Route("/smtp_config", func(r chi.Router) {
+						r.Get("/", systemSettings.GetSMTP)
+						r.Put("/", systemSettings.SetSMTP)
+						r.Post("/test", systemSettings.TestSMTP)
+					})
+					r.Route("/oauth_config/{provider}", func(r chi.Router) {
+						r.Get("/", systemSettings.GetOAuthConfig)
+						r.Put("/", systemSettings.SetOAuthConfig)
+					})
+					r.Route("/{key}", func(r chi.Router) {
+						r.Get("/", systemSettings.Get)
+						r.Put("/", systemSettings.Set)
+						r.Delete("/", systemSettings.Delete)
+					})
+				})
+			})
+		})
+	})
+
+	// Start HTTP server
+	srv := &http.Server{
+		Addr:         cfg.ListenAddr(),
+		Handler:      r,
+		ReadTimeout:  120 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Graceful shutdown
+	errCh := make(chan error, 1)
+	go func() {
+		log.Info().Str("addr", srv.Addr).Msg("http server listening")
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Info().Msg("shutting down")
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatal().Err(err).Msg("http server error")
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatal().Err(err).Msg("server shutdown error")
+	}
+
+	log.Info().Msg("server stopped")
+}
+
+func initEventPublisher(natsURL string) (service.EventPublisher, func()) {
+	noop := func() {}
+	if natsURL == "" {
+		log.Warn().Msg("NATS_URL not configured, notifications disabled")
+		return workers.NoopPublisher{}, noop
+	}
+
+	nc, err := nats.Connect(natsURL,
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			if err != nil {
+				log.Error().Err(err).Msg("nats disconnected")
+			}
+		}),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			log.Info().Msg("nats reconnected")
+		}),
+	)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to connect to NATS, notifications disabled")
+		return workers.NoopPublisher{}, noop
+	}
+
+	pub, err := workers.NewEventPublisher(nc, log.Logger)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to create event publisher, notifications disabled")
+		nc.Close()
+		return workers.NoopPublisher{}, noop
+	}
+
+	log.Info().Str("url", natsURL).Msg("connected to NATS for event publishing")
+	return pub, nc.Close
+}
+
+// seedOAuthConfig seeds OAuth provider config from env vars into the database
+// if no DB config exists yet. This provides backward compatibility — env vars
+// are used only for initial seeding, then the DB config takes over.
+func seedOAuthConfig(ctx context.Context, settings service.SystemSettingRepositoryInterface, encryptor *crypto.Encryptor, cfg *config.Config) {
+	type providerEnv struct {
+		name       string
+		settingKey string
+		enabledKey string
+		clientID   string
+		secret     string
+	}
+
+	providers := []providerEnv{
+		{
+			name:       "discord",
+			settingKey: model.SettingOAuthDiscordConfig,
+			enabledKey: model.SettingAuthDiscordEnabled,
+			clientID:   cfg.DiscordClientID,
+			secret:     cfg.DiscordClientSecret,
+		},
+		{
+			name:       "google",
+			settingKey: model.SettingOAuthGoogleConfig,
+			enabledKey: model.SettingAuthGoogleEnabled,
+			clientID:   cfg.GoogleClientID,
+			secret:     cfg.GoogleClientSecret,
+		},
+		{
+			name:       "github",
+			settingKey: model.SettingOAuthGitHubConfig,
+			enabledKey: model.SettingAuthGitHubEnabled,
+			clientID:   cfg.GitHubClientID,
+			secret:     cfg.GitHubClientSecret,
+		},
+		{
+			name:       "microsoft",
+			settingKey: model.SettingOAuthMicrosoftConfig,
+			enabledKey: model.SettingAuthMicrosoftEnabled,
+			clientID:   cfg.MicrosoftClientID,
+			secret:     cfg.MicrosoftClientSecret,
+		},
+	}
+
+	for _, p := range providers {
+		if p.clientID == "" || p.secret == "" {
+			continue // env vars not set, skip
+		}
+
+		// Check if DB config already exists
+		_, err := settings.Get(ctx, p.settingKey)
+		if err == nil {
+			log.Debug().Str("provider", p.name).Msg("oauth config already in database, skipping seed")
+			continue
+		}
+
+		// Encrypt the client secret
+		encryptedSecret, err := encryptor.Encrypt(p.secret)
+		if err != nil {
+			log.Error().Err(err).Str("provider", p.name).Msg("failed to encrypt oauth client secret for seeding")
+			continue
+		}
+
+		oauthCfg := model.OAuthProviderConfig{
+			ClientID:     p.clientID,
+			ClientSecret: encryptedSecret,
+		}
+
+		value, err := json.Marshal(oauthCfg)
+		if err != nil {
+			log.Error().Err(err).Str("provider", p.name).Msg("failed to marshal oauth config for seeding")
+			continue
+		}
+
+		if err := settings.Upsert(ctx, &model.SystemSetting{Key: p.settingKey, Value: value}); err != nil {
+			log.Error().Err(err).Str("provider", p.name).Msg("failed to seed oauth config")
+			continue
+		}
+
+		// Also seed the enabled setting
+		enabledValue, _ := json.Marshal(true)
+		if err := settings.Upsert(ctx, &model.SystemSetting{Key: p.enabledKey, Value: enabledValue}); err != nil {
+			log.Error().Err(err).Str("provider", p.name).Msg("failed to seed oauth enabled setting")
+			continue
+		}
+
+		log.Info().Str("provider", p.name).Msg("seeded oauth config from environment variables")
+	}
+}
