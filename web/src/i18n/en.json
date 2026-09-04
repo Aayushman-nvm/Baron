@@ -173,6 +173,18 @@
   "projects.create.keyHint": "1-5 uppercase letters/digits, must start with a letter",
   "projects.create.description": "Description",
   "projects.create.descriptionPlaceholder": "Optional description",
+  "projects.create.template": "Start from template",
+  "projects.create.templateNone": "Blank project",
+  "projects.create.templateApplied": "Workflow configuration will be copied from this template.",
+
+  "projects.template.saveAsTemplate": "Save as Template",
+  "projects.template.saveDescription": "Save this project's workflow and configuration as a reusable template.",
+  "projects.template.templateName": "Template name",
+  "projects.template.templateNamePlaceholder": "e.g. Vendor Onboarding",
+  "projects.template.templateDescPlaceholder": "Optional description",
+  "projects.template.save": "Save Template",
+  "projects.template.nameRequired": "Template name is required.",
+  "projects.template.saveError": "Failed to save template.",
 
   "projects.settings.title": "Settings",
   "projects.settings.subtitle": "Manage your project settings.",
