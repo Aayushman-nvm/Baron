@@ -956,7 +956,7 @@
   "changePassword.tooShort": "Password must be at least 8 characters.",
   "changePassword.error": "Failed to change password.",
 
-  "footer.poweredBy": "Powered by <brand>Taskwondo</brand>",
+  "footer.poweredBy": "Powered by <brand>Baron</brand>",
 
   "milestones.title": "Milestones",
   "milestones.description": "Track progress toward goals with milestones.",
