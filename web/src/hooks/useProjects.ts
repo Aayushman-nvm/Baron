@@ -17,10 +17,14 @@ import {
   deleteInvite,
   getInviteInfo,
   acceptInvite,
+  listProjectTemplates,
+  saveProjectAsTemplate,
+  deleteProjectTemplate,
   type CreateProjectInput,
   type UpdateProjectInput,
   type AddMemberInput,
   type CreateInviteInput,
+  type ProjectTemplate,
 } from '@/api/projects'
 
 export function useProjects() {
@@ -215,3 +219,35 @@ export function useAcceptInvite() {
     },
   })
 }
+
+// --- Project Template Hooks ---
+
+export function useProjectTemplates() {
+  return useQuery({
+    queryKey: ['project-templates'],
+    queryFn: listProjectTemplates,
+  })
+}
+
+export function useSaveProjectAsTemplate(projectKey: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ name, description }: { name: string; description?: string }) =>
+      saveProjectAsTemplate(projectKey, name, description),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project-templates'] })
+    },
+  })
+}
+
+export function useDeleteProjectTemplate() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (templateId: string) => deleteProjectTemplate(templateId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project-templates'] })
+    },
+  })
+}
+
+export type { ProjectTemplate }
