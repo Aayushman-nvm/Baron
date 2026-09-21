@@ -166,7 +166,10 @@ export function useUpdateTypeWorkflow(projectKey: string) {
     mutationFn: ({ workItemType, workflowId }: { workItemType: string; workflowId: string }) =>
       updateTypeWorkflow(projectKey, workItemType, workflowId),
     onSuccess: () => {
+      // Invalidate both the mapping and all cached workflow details for this
+      // project so the status dropdown reflects the new workflow immediately.
       qc.invalidateQueries({ queryKey: ['projects', projectKey, 'type-workflows'] })
+      qc.invalidateQueries({ queryKey: ['projects', projectKey, 'workflows'] })
     },
   })
 }
