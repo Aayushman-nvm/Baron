@@ -137,9 +137,9 @@ export function WorkItemDetailPage() {
   // Update browser tab title with work item display ID
   useEffect(() => {
     if (item) {
-      document.title = `${currentDisplayId} ${item.title} - Taskwondo`
+      document.title = `${currentDisplayId} ${item.title} - Baron`
     }
-    return () => { document.title = 'Taskwondo' }
+    return () => { document.title = 'Baron' }
   }, [item, currentDisplayId])
 
   // Clean up deep-link search params after reading them
