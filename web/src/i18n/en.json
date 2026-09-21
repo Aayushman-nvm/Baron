@@ -501,6 +501,9 @@
   "inlineComments.nextComment": "Next comment",
 
   "activity.noActivity": "No activity yet.",
+  "activity.panel.logs": "Logs",
+  "activity.panel.graph": "History",
+  "activity.panel.open": "Open activity panel",
   "activity.createdItem": "created this item",
   "activity.addedComment": "added",
   "activity.editedComment": "edited",
