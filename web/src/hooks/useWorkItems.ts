@@ -17,6 +17,7 @@ import {
   createRelation,
   deleteRelation,
   listEvents,
+  listProjectEvents,
   listAttachments,
   uploadAttachment,
   updateAttachmentComment,
@@ -229,6 +230,15 @@ export function useEvents(projectKey: string, itemNumber: number) {
     queryKey: ['projects', projectKey, 'items', itemNumber, 'events'],
     queryFn: () => listEvents(projectKey, itemNumber),
     enabled: !!projectKey && itemNumber > 0,
+  })
+}
+
+export function useProjectEvents(projectKey: string, namespaceSlug?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['projects', projectKey, 'events'],
+    queryFn: () => listProjectEvents(projectKey, namespaceSlug),
+    enabled: !!projectKey && enabled,
+    refetchInterval: 30_000, // poll every 30s so the log stays fresh
   })
 }
 
