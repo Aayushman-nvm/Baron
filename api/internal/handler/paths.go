@@ -24,4 +24,6 @@ const (
 	PathTeams            = "teams"
 	PathOncall           = "oncall"
 	PathDescriptionRevisions = "description-revisions"
+	PathProjectTemplates     = "project-templates"
+	PathSaveAsTemplate       = "save-as-template"
 )

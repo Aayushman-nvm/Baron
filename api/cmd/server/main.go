@@ -177,7 +177,10 @@ func main() {
 	adminService := service.NewAdminService(userRepo, projectRepo, projectMemberRepo, adminRepo)
 	statsService := service.NewStatsService(statsRepo, projectRepo, projectMemberRepo)
 
-	// Initialize embedding and search services
+	// Project templates
+	projectTemplateRepo := repository.NewProjectTemplateRepository(db)
+	projectTemplateService := service.NewProjectTemplateService(projectTemplateRepo, projectRepo, projectMemberRepo, typeWorkflowRepo)
+
 	embeddingService := service.NewEmbeddingService(cfg.OllamaURL, cfg.OllamaModel)
 	searchService := service.NewSearchService(embeddingService, embeddingRepo, workItemRepo, teamRepo, queueRepo, milestoneRepo, projectMemberRepo, systemSettingRepo)
 
@@ -325,6 +328,7 @@ func main() {
 	namespaces := handler.NewNamespaceHandler(namespaceService, cfg.BaseURL)
 	invites := handler.NewInviteHandler(projectService, namespaceService)
 	portal := handler.NewPortalHandler(workItemService, queueService, authService, cfg.MaxUploadSize)
+	projectTemplates := handler.NewProjectTemplateHandler(projectTemplateService)
 
 	metricsHandler := handler.NewMetricsHandler()
 
@@ -458,6 +462,12 @@ func main() {
 			// Projects (cross-namespace, no namespace middleware — returns all projects)
 			r.Get("/"+handler.PathProjects, projects.List)
 
+			// Project templates (global — not namespace-scoped)
+			r.Route("/"+handler.PathProjectTemplates, func(r chi.Router) {
+				r.Get("/", projectTemplates.List)
+				r.Delete("/{templateId}", projectTemplates.Delete)
+			})
+
 			// Projects (namespace-scoped)
 			r.Route("/{namespace}/"+handler.PathProjects, func(r chi.Router) {
 				r.Use(middleware.Namespace(namespaceService))
@@ -497,6 +507,7 @@ func main() {
 							r.Get("/", projects.ListTypeWorkflows)
 							r.Put("/{type}", projects.UpdateTypeWorkflow)
 						})
+						r.Post("/"+handler.PathSaveAsTemplate, projectTemplates.CreateFromProject)
 						r.Route("/"+handler.PathWorkflows, func(r chi.Router) {
 							r.Get("/", workflows.ListProjectWorkflows)
 							r.Get("/statuses", workflows.ListAvailableStatuses)

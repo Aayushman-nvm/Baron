@@ -148,7 +148,6 @@ export function WorkItemListPage() {
 
   const { p } = useNamespacePath()
   const { user } = useAuth()
-  const { statuses, transitionsMap } = useProjectWorkflow(projectKey ?? '')
   const { data: allStatuses } = useAvailableStatuses(projectKey ?? '')
 
   const { data: members } = useMembers(projectKey ?? '')
@@ -206,6 +205,12 @@ export function WorkItemListPage() {
     initialUrlRef.current.hasParams ? initialUrlRef.current.filter : {}
   )
   const [filterInitialized, setFilterInitialized] = useState(initialUrlRef.current.hasParams)
+
+  // When exactly one type is filtered, use that type's mapped workflow for the
+  // board columns and transition rules. Multiple types or no filter falls back
+  // to the project default — same behaviour as before.
+  const singleTypeFilter = filter.type?.length === 1 ? filter.type[0] : undefined
+  const { statuses, transitionsMap } = useProjectWorkflow(projectKey ?? '', singleTypeFilter)
   const [search, setSearch] = useState(initialUrlRef.current.search)
   const [viewMode, setViewMode] = useState<ViewMode>(initialUrlRef.current.view)
   const [sort, setSort] = useState(initialUrlRef.current.sort)

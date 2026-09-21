@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Trans, useTranslation } from 'react-i18next'
 import { useNamespacePath } from '@/hooks/useNamespacePath'
-import { useProject, useUpdateProject, useDeleteProject, useMembers, useAddMember, useUpdateMemberRole, useRemoveMember, useInvites, useCreateInvite, useDeleteInvite } from '@/hooks/useProjects'
+import { useProject, useUpdateProject, useDeleteProject, useMembers, useAddMember, useUpdateMemberRole, useRemoveMember, useInvites, useCreateInvite, useDeleteInvite, useSaveProjectAsTemplate } from '@/hooks/useProjects'
 import { useAuth } from '@/contexts/AuthContext'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
@@ -13,7 +13,7 @@ import { Avatar } from '@/components/ui/Avatar'
 import { Badge } from '@/components/ui/Badge'
 import { Tooltip } from '@/components/ui/Tooltip'
 import { Tabs } from '@/components/ui/Tabs'
-import { Check, Trash2, Copy, Link, AlertTriangle, ArrowRightLeft, ChevronDown, Info, Mail } from 'lucide-react'
+import { Check, Trash2, Copy, Link, AlertTriangle, ArrowRightLeft, ChevronDown, Info, Mail, LayoutTemplate } from 'lucide-react'
 import { useNamespaceContext } from '@/contexts/NamespaceContext'
 import { useMigrateProject } from '@/hooks/useNamespaces'
 import { clearLastProjectKey } from '@/hooks/useLastProjectKey'
@@ -24,6 +24,99 @@ import { useMentionAutocomplete } from '@/hooks/useMentionAutocomplete'
 import { getLocalizedError } from '@/utils/apiError'
 import { TeamsPage } from './TeamsPage'
 import type { UserSearchResult } from '@/api/users'
+
+// --- Save as Template section ---
+function SaveAsTemplateSection({ projectKey }: { projectKey: string }) {
+  const { t } = useTranslation()
+  const saveMutation = useSaveProjectAsTemplate(projectKey)
+  const [showModal, setShowModal] = useState(false)
+  const [templateName, setTemplateName] = useState('')
+  const [templateDesc, setTemplateDesc] = useState('')
+  const [error, setError] = useState('')
+  const [saved, setSaved] = useState(false)
+
+  function handleSave(e: React.FormEvent) {
+    e.preventDefault()
+    setError('')
+    if (!templateName.trim()) {
+      setError(t('projects.template.nameRequired'))
+      return
+    }
+    saveMutation.mutate(
+      { name: templateName.trim(), description: templateDesc.trim() || undefined },
+      {
+        onSuccess: () => {
+          setShowModal(false)
+          setTemplateName('')
+          setTemplateDesc('')
+          setSaved(true)
+          setTimeout(() => setSaved(false), 2000)
+        },
+        onError: (err) => {
+          setError(getLocalizedError(err, t, 'projects.template.saveError'))
+        },
+      },
+    )
+  }
+
+  return (
+    <>
+      <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 flex items-center justify-between">
+        <div>
+          <p className="text-sm font-medium text-gray-900 dark:text-gray-100 flex items-center gap-1.5">
+            <LayoutTemplate className="h-4 w-4 text-indigo-500" />
+            {t('projects.template.saveAsTemplate')}
+          </p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
+            {t('projects.template.saveDescription')}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {saved && <Check className="h-5 w-5 text-green-500 animate-[pulse_0.6s_ease-in-out_2]" />}
+          <Button variant="secondary" onClick={() => setShowModal(true)}>
+            {t('projects.template.saveAsTemplate')}
+          </Button>
+        </div>
+      </div>
+
+      <Modal
+        open={showModal}
+        onClose={() => { setShowModal(false); setError('') }}
+        title={t('projects.template.saveAsTemplate')}
+      >
+        <form onSubmit={handleSave} className="space-y-4">
+          <Input
+            label={`${t('projects.template.templateName')} *`}
+            value={templateName}
+            onChange={(e) => setTemplateName(e.target.value)}
+            placeholder={t('projects.template.templateNamePlaceholder')}
+          />
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              {t('common.description')}
+            </label>
+            <textarea
+              value={templateDesc}
+              onChange={(e) => setTemplateDesc(e.target.value)}
+              rows={3}
+              className="block w-full rounded-md border border-gray-300 dark:border-gray-600 px-3 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:bg-gray-800 dark:text-gray-100"
+              placeholder={t('projects.template.templateDescPlaceholder')}
+            />
+          </div>
+          {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+          <div className="flex justify-end gap-3 pt-2">
+            <Button type="button" variant="secondary" onClick={() => { setShowModal(false); setError('') }}>
+              {t('common.cancel')}
+            </Button>
+            <Button type="submit" disabled={saveMutation.isPending}>
+              {saveMutation.isPending ? t('common.saving') : t('projects.template.save')}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+    </>
+  )
+}
 
 function TruncatedName({ name, className }: { name: string; className?: string }) {
   const ref = useRef<HTMLSpanElement>(null)
@@ -546,6 +639,11 @@ export function ProjectSettingsPage() {
               </div>
             )}
           </form>
+
+          {/* Save as Template */}
+          {canManageMembers && (
+            <SaveAsTemplateSection projectKey={projectKey ?? ''} />
+          )}
 
           {/* Danger Zone */}
           {canManageMembers && (

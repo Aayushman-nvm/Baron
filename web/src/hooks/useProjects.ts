@@ -17,10 +17,14 @@ import {
   deleteInvite,
   getInviteInfo,
   acceptInvite,
+  listProjectTemplates,
+  saveProjectAsTemplate,
+  deleteProjectTemplate,
   type CreateProjectInput,
   type UpdateProjectInput,
   type AddMemberInput,
   type CreateInviteInput,
+  type ProjectTemplate,
 } from '@/api/projects'
 
 export function useProjects() {
@@ -162,7 +166,10 @@ export function useUpdateTypeWorkflow(projectKey: string) {
     mutationFn: ({ workItemType, workflowId }: { workItemType: string; workflowId: string }) =>
       updateTypeWorkflow(projectKey, workItemType, workflowId),
     onSuccess: () => {
+      // Invalidate both the mapping and all cached workflow details for this
+      // project so the status dropdown reflects the new workflow immediately.
       qc.invalidateQueries({ queryKey: ['projects', projectKey, 'type-workflows'] })
+      qc.invalidateQueries({ queryKey: ['projects', projectKey, 'workflows'] })
     },
   })
 }
@@ -215,3 +222,35 @@ export function useAcceptInvite() {
     },
   })
 }
+
+// --- Project Template Hooks ---
+
+export function useProjectTemplates() {
+  return useQuery({
+    queryKey: ['project-templates'],
+    queryFn: listProjectTemplates,
+  })
+}
+
+export function useSaveProjectAsTemplate(projectKey: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ name, description }: { name: string; description?: string }) =>
+      saveProjectAsTemplate(projectKey, name, description),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project-templates'] })
+    },
+  })
+}
+
+export function useDeleteProjectTemplate() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (templateId: string) => deleteProjectTemplate(templateId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['project-templates'] })
+    },
+  })
+}
+
+export type { ProjectTemplate }

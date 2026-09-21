@@ -1,11 +1,11 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { Search, Plus, Check } from 'lucide-react'
+import { Search, Plus, Check, LayoutTemplate } from 'lucide-react'
 import { getLocalizedError } from '@/utils/apiError'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useNamespacePath } from '@/hooks/useNamespacePath'
-import { useProjects, useCreateProject, useOwnedProjectCount, useMaxProjects } from '@/hooks/useProjects'
+import { useProjects, useCreateProject, useOwnedProjectCount, useMaxProjects, useProjectTemplates } from '@/hooks/useProjects'
 import { useAuth } from '@/contexts/AuthContext'
 import { useNamespaceContext } from '@/contexts/NamespaceContext'
 import { useSidebar } from '@/contexts/SidebarContext'
@@ -101,6 +101,8 @@ export function ProjectListPage() {
 
   const { namespaces, activeNamespace, showSwitcher } = useNamespaceContext()
 
+  const { data: templates } = useProjectTemplates()
+
   const [showCreate, setShowCreate] = useState(false)
   const [activeRow, setActiveRow] = useState(-1)
   const [searchInput, setSearchInput] = useState('')
@@ -112,11 +114,13 @@ export function ProjectListPage() {
   const [formError, setFormError] = useState('')
   const [showNsPicker, setShowNsPicker] = useState(false)
   const [showNsCreate, setShowNsCreate] = useState(false)
+  const [selectedTemplateId, setSelectedTemplateId] = useState('')
 
   const selectedNs = namespaces.find((ns) => ns.slug === selectedNamespace) ?? activeNamespace
 
   const openCreateModal = () => {
     setSelectedNamespace(activeNamespace?.slug ?? '')
+    setSelectedTemplateId('')
     setShowCreate(true)
   }
 
@@ -206,14 +210,24 @@ export function ProjectListPage() {
     e.preventDefault()
     setFormError('')
     if (!name.trim() || !key.trim()) return
+
+    // Find selected template to pass default_workflow_id if applicable
+    const template = templates?.find((t) => t.id === selectedTemplateId)
+
     createMutation.mutate(
-      { name: name.trim(), key: key.trim().toUpperCase(), description: description.trim() || undefined },
+      {
+        name: name.trim(),
+        key: key.trim().toUpperCase(),
+        description: description.trim() || undefined,
+        default_workflow_id: template?.default_workflow_id,
+      },
       {
         onSuccess: (project) => {
           setShowCreate(false)
           setName('')
           setKey('')
           setDescription('')
+          setSelectedTemplateId('')
           navigate(p(`/projects/${project.key}`))
         },
         onError: (err) => {
@@ -357,6 +371,31 @@ export function ProjectListPage() {
           <p className="text-sm text-amber-600 dark:text-amber-400 mb-4">{t('projects.limitReached')}</p>
         )}
         <form onSubmit={handleCreate} className="space-y-4">
+          {/* Template picker */}
+          {templates && templates.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1 flex items-center gap-1.5">
+                <LayoutTemplate className="h-3.5 w-3.5" />
+                {t('projects.create.template')}
+              </label>
+              <select
+                value={selectedTemplateId}
+                onChange={(e) => setSelectedTemplateId(e.target.value)}
+                disabled={atLimit}
+                className="block w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              >
+                <option value="">{t('projects.create.templateNone')}</option>
+                {templates.map((tpl) => (
+                  <option key={tpl.id} value={tpl.id}>{tpl.name}</option>
+                ))}
+              </select>
+              {selectedTemplateId && (
+                <p className="mt-1 text-xs text-indigo-600 dark:text-indigo-400">
+                  {t('projects.create.templateApplied')}
+                </p>
+              )}
+            </div>
+          )}
           <Input
             label={t('projects.create.name')}
             value={name}

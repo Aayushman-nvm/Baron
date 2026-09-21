@@ -70,6 +70,7 @@ export interface CreateProjectInput {
   name: string
   key: string
   description?: string
+  default_workflow_id?: string
 }
 
 export async function createProject(input: CreateProjectInput) {
@@ -219,3 +220,30 @@ export async function acceptInvite(code: string) {
   const res = await api.post<{ data: AcceptInviteResult }>(`/invites/${code}/accept`)
   return res.data.data
 }
+
+// --- Project Templates ---
+
+export interface ProjectTemplate {
+  id: string
+  name: string
+  description?: string
+  created_by: string
+  default_workflow_id?: string
+  allowed_complexity_values: number[]
+  type_workflows: { work_item_type: string; workflow_id: string }[]
+}
+
+export async function listProjectTemplates(): Promise<ProjectTemplate[]> {
+  const res = await api.get<{ data: ProjectTemplate[] }>('/project-templates')
+  return res.data.data
+}
+
+export async function saveProjectAsTemplate(projectKey: string, name: string, description?: string): Promise<ProjectTemplate> {
+  const res = await api.post<{ data: ProjectTemplate }>(`${nsPrefix()}/projects/${projectKey}/save-as-template`, { name, description })
+  return res.data.data
+}
+
+export async function deleteProjectTemplate(templateId: string): Promise<void> {
+  await api.delete(`/project-templates/${templateId}`)
+}
+
