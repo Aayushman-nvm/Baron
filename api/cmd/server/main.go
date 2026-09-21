@@ -181,6 +181,9 @@ func main() {
 	projectTemplateRepo := repository.NewProjectTemplateRepository(db)
 	projectTemplateService := service.NewProjectTemplateService(projectTemplateRepo, projectRepo, projectMemberRepo, typeWorkflowRepo)
 
+	// Project events (global activity log)
+	projectEventRepo := repository.NewProjectEventRepository(db)
+
 	embeddingService := service.NewEmbeddingService(cfg.OllamaURL, cfg.OllamaModel)
 	searchService := service.NewSearchService(embeddingService, embeddingRepo, workItemRepo, teamRepo, queueRepo, milestoneRepo, projectMemberRepo, systemSettingRepo)
 
@@ -329,6 +332,7 @@ func main() {
 	invites := handler.NewInviteHandler(projectService, namespaceService)
 	portal := handler.NewPortalHandler(workItemService, queueService, authService, cfg.MaxUploadSize)
 	projectTemplates := handler.NewProjectTemplateHandler(projectTemplateService)
+	projectEvents := handler.NewProjectEventsHandler(projectEventRepo, projectService)
 
 	metricsHandler := handler.NewMetricsHandler()
 
@@ -508,6 +512,7 @@ func main() {
 							r.Put("/{type}", projects.UpdateTypeWorkflow)
 						})
 						r.Post("/"+handler.PathSaveAsTemplate, projectTemplates.CreateFromProject)
+						r.Get("/events", projectEvents.ListProjectEvents)
 						r.Route("/"+handler.PathWorkflows, func(r chi.Router) {
 							r.Get("/", workflows.ListProjectWorkflows)
 							r.Get("/statuses", workflows.ListAvailableStatuses)
