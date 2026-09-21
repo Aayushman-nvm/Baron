@@ -526,3 +526,33 @@ export async function listWatchedItems(projectKeys: string[], filter: WorkItemFi
   const res = await api.get<WorkItemListResponse>('/user/watchlist', { params })
   return res.data
 }
+
+// --- Project-wide activity log ---
+
+export interface ProjectEvent {
+  id: string
+  work_item_id: string
+  item_number: number
+  item_title: string
+  display_id: string
+  event_type: string
+  actor?: { id: string; display_name: string }
+  field_name?: string
+  old_value?: string
+  new_value?: string
+  metadata: Record<string, unknown>
+  visibility: string
+  created_at: string
+}
+
+export async function listProjectEvents(
+  projectKey: string,
+  _namespaceSlug?: string,
+  limit = 200,
+): Promise<ProjectEvent[]> {
+  const res = await api.get<{ data: ProjectEvent[] }>(
+    `${nsPrefix()}/projects/${projectKey}/events`,
+    { params: { limit } },
+  )
+  return res.data.data
+}
