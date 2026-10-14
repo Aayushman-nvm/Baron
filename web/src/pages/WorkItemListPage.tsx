@@ -472,6 +472,9 @@ export function WorkItemListPage() {
 
   const activeFilter = useMemo(() => ({
     ...filter,
+    // Board view shows all workflow columns including done/cancelled, so the
+    // status filter must not be applied — items in every column need to load.
+    status: viewMode === 'board' ? undefined : filter.status,
     q: debouncedSearch || undefined,
     sort,
     order,
